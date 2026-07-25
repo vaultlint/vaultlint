@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use vaultlint::report::{self, FailOn};
+use vaultlint::report::{self, FailOn, Format};
 use vaultlint::{scan, ScanOptions};
 
 #[derive(Parser)]
@@ -26,6 +26,8 @@ enum Command {
         path: PathBuf,
         #[arg(long, value_enum, default_value_t = FailOnArg::High)]
         fail_on: FailOnArg,
+        #[arg(long, value_enum, default_value_t = FormatArg::Human)]
+        format: FormatArg,
     },
 }
 
@@ -48,9 +50,30 @@ impl From<FailOnArg> for FailOn {
     }
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum FormatArg {
+    Human,
+    Json,
+    Sarif,
+}
+
+impl From<FormatArg> for Format {
+    fn from(value: FormatArg) -> Self {
+        match value {
+            FormatArg::Human => Format::Human,
+            FormatArg::Json => Format::Json,
+            FormatArg::Sarif => Format::Sarif,
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let Command::Scan { path, fail_on } = cli.command;
+    let Command::Scan {
+        path,
+        fail_on,
+        format,
+    } = cli.command;
 
     if !path.exists() {
         eprintln!("error: path does not exist: {}", path.display());
@@ -61,7 +84,7 @@ fn main() -> ExitCode {
     let colour = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
 
     let mut stdout = std::io::stdout().lock();
-    if let Err(error) = report::human::render(&report_data, &mut stdout, colour) {
+    if let Err(error) = report::render(&report_data, format.into(), &mut stdout, colour) {
         eprintln!("error: writing report: {error}");
         return ExitCode::from(2);
     }

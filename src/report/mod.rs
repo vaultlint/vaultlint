@@ -1,7 +1,30 @@
 pub mod human;
+pub mod json;
+pub mod sarif;
 
 use crate::finding::Severity;
 use crate::ScanReport;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Human,
+    Json,
+    Sarif,
+}
+
+pub fn render(
+    report: &ScanReport,
+    format: Format,
+    out: &mut dyn std::io::Write,
+    colour: bool,
+) -> anyhow::Result<()> {
+    match format {
+        Format::Human => human::render(report, out, colour)?,
+        Format::Json => json::render(report, out)?,
+        Format::Sarif => sarif::render(report, out)?,
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailOn {
@@ -94,5 +117,55 @@ mod tests {
         assert_eq!(exit_code(&medium, FailOn::Medium), 1);
         assert_eq!(exit_code(&medium, FailOn::Never), 0);
         assert_eq!(exit_code(&report(Vec::new()), FailOn::Low), 0);
+    }
+
+    #[test]
+    fn json_output_is_a_flat_array_of_findings() {
+        let mut out = Vec::new();
+        json::render(&report(vec![finding(Severity::High)]), &mut out).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(parsed[0]["rule_id"], "VL001");
+        assert_eq!(parsed[0]["severity"], "high");
+        assert_eq!(parsed[0]["line"], 42);
+        assert_eq!(parsed[0]["docs_url"], "https://vaultlint.com/rules/VL001");
+    }
+
+    #[test]
+    fn sarif_output_carries_tool_rules_and_locations() {
+        let mut out = Vec::new();
+        sarif::render(&report(vec![finding(Severity::Medium)]), &mut out).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(parsed["version"], "2.1.0");
+        assert_eq!(parsed["runs"][0]["tool"]["driver"]["name"], "vaultlint");
+        let result = &parsed["runs"][0]["results"][0];
+        assert_eq!(result["ruleId"], "VL001");
+        assert_eq!(result["level"], "warning");
+        assert_eq!(
+            result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            "programs/staking/src/withdraw.rs"
+        );
+        assert_eq!(
+            result["locations"][0]["physicalLocation"]["region"]["startLine"],
+            42
+        );
+    }
+
+    #[test]
+    fn sarif_declares_every_rule_that_produced_a_finding_once() {
+        let mut out = Vec::new();
+        sarif::render(
+            &report(vec![finding(Severity::High), finding(Severity::Medium)]),
+            &mut out,
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        let rules = parsed["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["id"], "VL001");
     }
 }
