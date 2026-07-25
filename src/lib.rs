@@ -1,3 +1,7 @@
+pub mod finding;
+pub mod parse;
+pub mod scan;
+
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
