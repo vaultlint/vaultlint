@@ -330,6 +330,7 @@ dependencies = [
  "clap",
  "owo-colors",
  "proc-macro2",
+ "quote",
  "serde",
  "serde_json",
  "syn 2.0.119",

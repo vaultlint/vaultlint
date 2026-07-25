@@ -22,3 +22,6 @@ serde_json = "1"
 syn = { version = "2", features = ["full", "visit", "extra-traits"] }
 toml = "0.8"
 walkdir = "2"
+
+[dev-dependencies]
+quote = "1"

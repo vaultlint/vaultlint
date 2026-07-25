@@ -1,3 +1,4 @@
+pub mod anchor;
 pub mod finding;
 pub mod parse;
 pub mod scan;
