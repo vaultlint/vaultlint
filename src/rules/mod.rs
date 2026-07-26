@@ -1,3 +1,4 @@
+pub mod owner;
 pub mod signer;
 
 use std::path::Path;
@@ -54,8 +55,20 @@ impl RuleContext<'_> {
     }
 }
 
+/// Token text of an AST node with all whitespace removed, so that
+/// `account . data . borrow ()` becomes `account.data.borrow()` and rules can
+/// ask simple textual questions about a fragment they do not want to walk.
+pub(crate) fn normalised(tokens: &impl quote::ToTokens) -> String {
+    quote::ToTokens::to_token_stream(tokens)
+        .to_string()
+        .replace(char::is_whitespace, "")
+}
+
 pub fn all() -> Vec<Box<dyn Rule>> {
-    vec![Box::new(signer::MissingSignerCheck)]
+    vec![
+        Box::new(signer::MissingSignerCheck),
+        Box::new(owner::MissingOwnerCheck),
+    ]
 }
 
 #[cfg(test)]
