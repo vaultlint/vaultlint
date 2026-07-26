@@ -1,4 +1,5 @@
 pub mod arithmetic;
+pub mod cpi;
 pub mod owner;
 pub mod pda;
 pub mod signer;
@@ -72,6 +73,7 @@ pub fn all() -> Vec<Box<dyn Rule>> {
         Box::new(owner::MissingOwnerCheck),
         Box::new(arithmetic::UncheckedArithmetic),
         Box::new(pda::UnvalidatedPdaBump),
+        Box::new(cpi::UncheckedCpi),
     ]
 }
 
