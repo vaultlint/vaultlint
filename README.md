@@ -79,11 +79,22 @@ Exit codes make it CI-ready: `0` when nothing exceeds the threshold, `1` when it
 Every rule is deliberately narrow. A linter that cries wolf on healthy code gets
 uninstalled the same day, so vaultlint prefers a missed finding to a false one.
 
-Silence a specific finding with a comment on its line or the line above:
+Silence a specific finding with a comment on its own line, or anywhere in the
+block of comments and attributes directly above it:
 
 ```rust
 // vaultlint:allow VL003 — audited, cannot underflow
 vault.balance = vault.balance - fee;
+```
+
+The comment does not have to sit immediately above the finding, so it still
+works on the fields where Anchor mandates a `/// CHECK:` doc comment or an
+`#[account(...)]` attribute in that position:
+
+```rust
+// vaultlint:allow VL001 — authority is verified in the handler
+/// CHECK: verified in the handler
+pub authority: AccountInfo<'info>,
 ```
 
 ## In CI

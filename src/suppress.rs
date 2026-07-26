@@ -30,7 +30,9 @@ pub fn is_suppressed(source: &str, finding: &Finding) -> bool {
     }
 
     // bracket_depth tracks how deep we are inside a multi-line attribute.
-    // We count closing brackets we see while going up (they opened on lines above).
+    // Only `(` / `)` and `[` / `]` are counted; `{` and `}` are block boundaries
+    // in Rust — a `}` stops the walk immediately rather than being treated as an
+    // attribute continuation.
     // NOTE: brackets inside string literals are not excluded; a full lexer would
     // be needed for that. This is a known limitation.
     let mut bracket_depth: usize = 0;
@@ -39,12 +41,21 @@ pub fn is_suppressed(source: &str, finding: &Finding) -> bool {
         let Some(line) = lines.get(i) else { break };
         let trimmed = line.trim();
 
-        // Account for brackets on this line to track multi-line attribute depth.
-        // Going upward: `(`, `[`, `{` close depth; `)`, `]`, `}` open depth.
-        for ch in trimmed.chars() {
+        // A closing brace is a block boundary — stop here; do not absorb it.
+        if trimmed.contains('}') && bracket_depth == 0 {
+            break;
+        }
+
+        // Account for attribute brackets on this line (right-to-left so we know
+        // the depth at the *start* of the line before deciding whether the line
+        // is a continuation of a multi-line attribute).
+        // Going upward: `)` and `]` open depth; `(` and `[` close depth.
+        // `{` / `}` are intentionally excluded — they are block boundaries, not
+        // attribute delimiters.
+        for ch in trimmed.chars().rev() {
             match ch {
-                ')' | ']' | '}' => bracket_depth += 1,
-                '(' | '[' | '{' => {
+                ')' | ']' => bracket_depth += 1,
+                '(' | '[' => {
                     bracket_depth = bracket_depth.saturating_sub(1);
                 }
                 _ => {}
@@ -326,5 +337,68 @@ let unrelated = 1;
 vault.balance = vault.balance - amount;
 ";
         assert!(!is_suppressed(source, &finding_with_id("VL003", 3)));
+    }
+
+    // ── Closing-brace boundary: the walk must not cross a `}` ───────────────
+
+    /// An allow comment inside a preceding block must NOT suppress a finding
+    /// that is outside that block, even if only blank / comment lines separate
+    /// the `}` from the finding.
+    ///
+    /// This is the critical regression test: the old code counted `}` as an
+    /// attribute depth opener, which could drive `bracket_depth > 0` and make
+    /// the walker absorb arbitrary preceding code.
+    #[test]
+    fn does_not_cross_a_closing_brace() {
+        let source = "\
+fn a() {
+    // vaultlint:allow VL003
+    let y = 2;
+}
+
+vault.balance = vault.balance - amount;
+";
+        assert!(!is_suppressed(source, &finding_with_id("VL003", 6)));
+    }
+
+    // ── Right-to-left bracket accounting ────────────────────────────────────
+
+    /// A line that both opens and closes an attribute bracket on the same line
+    /// (e.g. `#[account(mut)]`) must leave `bracket_depth` at zero after being
+    /// processed. If the per-line scan goes left-to-right instead of
+    /// right-to-left the depth could be transiently non-zero at the wrong
+    /// moment, allowing lines that should break the block to be absorbed.
+    ///
+    /// We test with an allow comment directly above a single-line `#[account(mut)]`
+    /// attribute — suppression MUST work — and then verify that walking further
+    /// up through a closing brace still stops the walk.
+    #[test]
+    fn bracket_accounting_handles_open_and_close_on_same_line() {
+        // Finding on line 3 (`pub authority: Signer<'info>,`).
+        // Line 2 is `#[account(mut)]` (brackets open and close on the same line,
+        // net depth = 0 after processing right-to-left).
+        // Line 1 is the allow comment.
+        let source = "\
+// vaultlint:allow VL001 — reviewed
+#[account(mut)]
+pub authority: Signer<'info>,
+";
+        assert!(is_suppressed(source, &finding_with_id("VL001", 3)));
+    }
+
+    /// Companion negative: an allow comment separated from the finding by a
+    /// closing brace and a single-line attribute must NOT suppress.
+    #[test]
+    fn does_not_cross_closing_brace_even_with_single_line_attribute() {
+        let source = "\
+fn prev() {
+    // vaultlint:allow VL001
+}
+
+#[account(mut)]
+pub authority: Signer<'info>,
+";
+        // Finding is on line 6.  The walk will hit the `}` on line 3 and stop.
+        assert!(!is_suppressed(source, &finding_with_id("VL001", 6)));
     }
 }
