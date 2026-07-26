@@ -174,6 +174,35 @@ impl LinkedBody {
     fn base(&self, field: &str) -> String {
         format!("{}.{}", self.prefix, field)
     }
+
+    /// Every spelling under which this struct's field can be named in this body:
+    /// the fully qualified `ctx.accounts.<F>` / `self.<F>`, and the bare `<F>`
+    /// that a handler gets from binding the field to a local first.
+    ///
+    /// Both real instances of this bug bind first — marginfi destructures
+    /// (`let MarginfiAccountInitializePda { authority, .. } = ctx.accounts;`) and
+    /// metaplex aliases (`let authority = &ctx.accounts.authority;`) — so a
+    /// search that only knows the qualified spelling misses the very shape this
+    /// rule exists for.
+    ///
+    /// Accepting the bare name is safe because the searches it feeds are
+    /// "was the field actually used / actually checked" filters, not the
+    /// discriminator. The discriminating work is done by T1–T4, which almost
+    /// nothing reaches. Where the looseness could cost something — S4 and the
+    /// forwarding hop, which *silence* findings — it errs towards silence on
+    /// code that does check, which is the direction we want. The
+    /// whole-identifier boundary in `contains_access` still applies, so
+    /// `vault.authority.key()` is not a reference to our `authority`.
+    fn spellings(&self, field: &str) -> [String; 2] {
+        [self.base(field), field.to_string()]
+    }
+
+    /// True if this body reads `<field>.<member>` under either spelling.
+    fn reads_field(&self, field: &str, member: &str) -> bool {
+        self.spellings(field)
+            .iter()
+            .any(|base| reads(&self.text, base, member))
+    }
 }
 
 /// Token text of a body with whitespace removed everywhere it is not needed to
@@ -293,14 +322,19 @@ impl<'ast> Visit<'ast> for ForwardedTo {
 /// The argument positions at which `field` leaves this body, in every spelling
 /// that still carries the account: bare, borrowed, and via `.to_account_info()`.
 fn forwarded_arguments(body: &LinkedBody, field: &str) -> Vec<(String, usize)> {
-    let base = body.base(field);
+    // Both the qualified and the bare spelling, for the same reason T5 accepts
+    // both: a handler that destructures first still forwards the same account,
+    // and if the hop cannot see it the `get_fee_payer` suppression stops firing
+    // on exactly the handlers T5 newly reaches.
+    let mut spellings = Vec::new();
+    for base in body.spellings(field) {
+        spellings.push(format!("&{base}.to_account_info()"));
+        spellings.push(format!("{base}.to_account_info()"));
+        spellings.push(format!("&{base}"));
+        spellings.push(base);
+    }
     let mut visitor = ForwardedTo {
-        spellings: vec![
-            base.clone(),
-            format!("&{base}"),
-            format!("{base}.to_account_info()"),
-            format!("&{base}.to_account_info()"),
-        ],
+        spellings,
         hits: Vec::new(),
     };
     visitor.visit_block(&body.block);
@@ -309,7 +343,10 @@ fn forwarded_arguments(body: &LinkedBody, field: &str) -> Vec<(String, usize)> {
 
 /// S4 — a use site establishes that `field` signed, directly or one call away.
 fn establishes_signer(ctx: &LinkedContext<'_>, body: &LinkedBody, field: &str) -> bool {
-    if reads(&body.text, &body.base(field), "is_signer") {
+    // Both spellings, symmetrically with T5. If T5 can see a destructured
+    // `authority.key()` but S4 can only see `ctx.accounts.authority.is_signer`,
+    // a handler that destructures *and then checks* becomes a false positive.
+    if body.reads_field(field, "is_signer") {
         return true;
     }
     // One hop.  metaplex's four `Buy` variants are false positives purely
@@ -344,7 +381,11 @@ impl LinkedRule for UnprovenAuthorityOnInit {
 
     fn check(&self, ctx: &LinkedContext<'_>, out: &mut Vec<Finding>) {
         for accounts in &ctx.anchor.accounts_structs {
-            // T3 — something here is being created.
+            // T3 — something here is being created. Logically subsumed by T4,
+            // which looks the field's name up *among these same* `init` fields
+            // and so cannot succeed when the list is empty; kept as a cheap
+            // early-out over structs that can never fire. Its redundancy is
+            // deliberate, not a bug — deleting it changes no result.
             let init_fields: Vec<&AccountField> =
                 accounts.fields.iter().filter(|f| carries_init(f)).collect();
             if init_fields.is_empty() {
@@ -417,7 +458,7 @@ impl LinkedRule for UnprovenAuthorityOnInit {
                 // the crate at all, out of the results.
                 if !bodies
                     .iter()
-                    .any(|body| reads(&body.text, &body.base(&field.name), "key()"))
+                    .any(|body| body.reads_field(&field.name, "key()"))
                 {
                     continue;
                 }
@@ -894,6 +935,129 @@ pub fn initialize_account_pda(ctx: Context<MarginfiAccountInitializePda>) -> Res
         ]);
 
         assert_flags_authority(&insecure, &findings);
+    }
+
+    // ── the field bound to a local first ────────────────────────────────────
+    //
+    // T5 and S4 must see the *same* set of spellings. If T5 learns the bare name
+    // and S4 does not, a handler that binds the field to a local and then checks
+    // `is_signer` on it turns from a correct silence into a false positive — so
+    // each trigger case below is paired with its suppression case, and neither
+    // pair passes on its own if the two searches drift apart.
+
+    /// marginfi's real handler
+    /// (`programs/marginfi/src/instructions/marginfi_account/initialize.rs`)
+    /// destructures `ctx.accounts` before touching anything. This *is* the
+    /// confirmed true positive; a rule that only knows
+    /// `ctx.accounts.authority.key()` is silent on the one bug it exists for.
+    const DESTRUCTURING_HANDLER: &str = r#"
+pub fn initialize_account_pda(ctx: Context<MarginfiAccountInitializePda>) -> Result<()> {
+    let MarginfiAccountInitializePda { authority, marginfi_group, marginfi_account, .. } =
+        ctx.accounts;
+    marginfi_account.initialize(marginfi_group.key(), authority.key());
+    Ok(())
+}
+"#;
+
+    /// metaplex `CreateAuctionHouse` aliases instead of destructuring, and then
+    /// writes `auction_house.authority = authority.key();`.
+    const ALIASING_HANDLER: &str = r#"
+pub fn initialize_account_pda(ctx: Context<MarginfiAccountInitializePda>) -> Result<()> {
+    let authority = &ctx.accounts.authority;
+    ctx.accounts.marginfi_account.initialize(authority.key());
+    Ok(())
+}
+"#;
+
+    #[test]
+    fn a_destructured_binding_is_still_a_read_of_the_field() {
+        let source = format!("{}{}", marginfi(), DESTRUCTURING_HANDLER);
+
+        assert_flags_authority(&source, &one_file(&source));
+    }
+
+    #[test]
+    fn an_is_signer_check_on_a_destructured_binding_silences_the_finding() {
+        let source = format!(
+            "{}{}",
+            marginfi(),
+            r#"
+pub fn initialize_account_pda(ctx: Context<MarginfiAccountInitializePda>) -> Result<()> {
+    let MarginfiAccountInitializePda { authority, marginfi_group, marginfi_account, .. } =
+        ctx.accounts;
+    require!(authority.is_signer, MarginfiError::Unauthorized);
+    marginfi_account.initialize(marginfi_group.key(), authority.key());
+    Ok(())
+}
+"#
+        );
+
+        assert!(one_file(&source).is_empty(), "{:?}", one_file(&source));
+    }
+
+    #[test]
+    fn an_aliased_local_is_still_a_read_of_the_field() {
+        let source = format!("{}{}", marginfi(), ALIASING_HANDLER);
+
+        assert_flags_authority(&source, &one_file(&source));
+    }
+
+    #[test]
+    fn an_is_signer_check_on_an_aliased_local_silences_the_finding() {
+        let source = format!(
+            "{}{}",
+            marginfi(),
+            r#"
+pub fn initialize_account_pda(ctx: Context<MarginfiAccountInitializePda>) -> Result<()> {
+    let authority = &ctx.accounts.authority;
+    require!(authority.is_signer, MarginfiError::Unauthorized);
+    ctx.accounts.marginfi_account.initialize(authority.key());
+    Ok(())
+}
+"#
+        );
+
+        assert!(one_file(&source).is_empty(), "{:?}", one_file(&source));
+    }
+
+    /// The forwarding hop has to know the bare spelling too, or `get_fee_payer`
+    /// stops suppressing on exactly the handlers T5 newly reaches.
+    #[test]
+    fn an_is_signer_check_one_call_away_from_an_aliased_local_silences_the_finding() {
+        let source = format!(
+            "{}{}{}",
+            marginfi(),
+            r#"
+pub fn initialize_account_pda(ctx: Context<MarginfiAccountInitializePda>) -> Result<()> {
+    let authority = &ctx.accounts.authority;
+    get_fee_payer(authority, &ctx.accounts.fee_payer)?;
+    ctx.accounts.marginfi_account.initialize(authority.key());
+    Ok(())
+}
+"#,
+            FEE_PAYER_HELPER
+        );
+
+        assert!(one_file(&source).is_empty(), "{:?}", one_file(&source));
+    }
+
+    /// The bare spelling keeps the whole-identifier boundary: reading the key
+    /// *stored inside another account* is not a read of the account we were
+    /// handed, so T5 stays unsatisfied.
+    #[test]
+    fn a_field_access_in_the_handler_does_not_satisfy_t5() {
+        let source = format!(
+            "{}{}",
+            marginfi(),
+            r#"
+pub fn initialize_account_pda(ctx: Context<MarginfiAccountInitializePda>) -> Result<()> {
+    let stored = ctx.accounts.marginfi_group.vault.authority.key();
+    Ok(())
+}
+"#
+        );
+
+        assert!(one_file(&source).is_empty(), "{:?}", one_file(&source));
     }
 
     // ── the marker set ──────────────────────────────────────────────────────
