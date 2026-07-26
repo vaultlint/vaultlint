@@ -50,7 +50,7 @@ impl Rule for UnvalidatedPdaBump {
                             out.push(ctx.finding(
                                 "VL004",
                                 Severity::Medium,
-                                "PDA bump is not validated",
+                                "non-canonical PDA bump",
                                 format!(
                                     "`{}` uses `bump = {expr}`, where `{expr}` is an \
                                      `#[instruction]` argument. An attacker controls this value \
@@ -91,7 +91,7 @@ impl<'ast> Visit<'ast> for DerivationVisitor<'_, '_> {
                     self.ctx.finding(
                         "VL004",
                         Severity::Medium,
-                        "PDA bump is not validated",
+                        "non-canonical PDA bump",
                         "`create_program_address` accepts any bump, including non-canonical ones."
                             .to_string(),
                         "Use `find_program_address`, or compare the result against a stored \

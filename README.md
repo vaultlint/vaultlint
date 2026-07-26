@@ -39,7 +39,7 @@ $ vaultlint scan ./examples/vulnerable
         `authority` is not constrained as Signer. Any account can be passed here.
         Declare the field as `Signer<'info>`, or add `constraint = <account>.is_signer`.
 
-⚠ MED  PDA bump is not validated
+⚠ MED  non-canonical PDA bump
         ./examples/vulnerable/pda_bump.rs:7
         `vault` uses `bump = user_bump`, where `user_bump` is an `#[instruction]` argument. An attacker controls this value and can pass a non-canonical bump to address a different account.
         Store the canonical bump (from `init`) in the account data and validate with `bump = <account>.bump`.
