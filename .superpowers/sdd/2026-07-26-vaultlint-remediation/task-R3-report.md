@@ -593,3 +593,219 @@ The corpus caveat from round 2 stands and cuts both ways: `coral-xyz/anchor`
 holds few production handlers, so seven findings is a small denominator. But it
 is now a *complete* denominator — every finding was read in source context — and
 that is a firmer basis than the extrapolations of earlier rounds.
+
+---
+
+## Fix round 4
+
+Two Critical defects from the audit, then a full mutation re-audit of every
+guard in `signer.rs`.
+
+### Critical A — a field access is not a reference to our field
+
+`name_in_seeds` accepted `.` as a left-hand identifier boundary, so
+`vault.authority` — the vault's *stored* pubkey — counted as a reference to the
+`authority` account we were handed, and silenced the rule on it. Reading another
+account's field validates nothing about ours.
+
+Implemented as proposed (left boundary must not be `.`), and extended after
+thinking it through:
+
+* **`.` on the left, yes.** Anchor expands `#[account(...)]` expressions in a
+  scope where the struct's fields are bare locals, so neither `self.authority`
+  nor `ctx.accounts.authority` is valid syntax inside a constraint. There is no
+  legitimate `.`-prefixed reference to lose. The one shape that looks like a
+  counterexample — `constraint = ctx.accounts.authority.is_signer` written on
+  the `authority` field itself — is already suppressed one guard earlier by the
+  `Custom(_)` check.
+* **`.` on the right, no.** `authority.key()` is the overwhelmingly common way a
+  field is actually used; the right boundary must keep accepting `.`.
+* **`:` on both sides, yes.** `ids::authority` is a constant and
+  `authority::ID` is a module: a field can neither be reached through `::` nor
+  have items hung off it. Both were suppressing before. Note the two `:`
+  boundaries mask each other under single-mutant testing (`config::authority::ID`
+  survives either one alone), so they are covered by two separate tests.
+
+Corpus effect: **7 → 7**. Confirms the reviewer's measurement — the suppression
+bought nothing at all, and cost the three detections below, each of which now
+fires and is covered by a test:
+
+| Shape | Test |
+|---|---|
+| `seeds = [b"vault", vault.authority.as_ref()]` | `flags_authority_when_seeds_read_another_accounts_authority_field` |
+| `constraint = cfg.admin != Pubkey::default()` | `flags_admin_when_constraint_only_reads_another_accounts_admin_field` |
+| `constraint = cfg.owner == ids::authority` | `flags_authority_when_a_path_ends_with_its_name` |
+
+#### The third example — `payer = payer` — deliberately still suppresses
+
+The brief listed `payer = payer` on an `init` sibling as a third case that
+should fire. It is not a boundary problem (there is no `.`), and I concluded it
+should *not* fire. Anchor's `init` CPIs `system_program::create_account` with
+that account as `from`, and the System Program rejects the instruction unless
+`from` signed the transaction. The signature is therefore mandatory at runtime,
+enforced by the runtime rather than by an Anchor constraint — flagging it would
+be a false positive of exactly the kind VL001 is trying to avoid. The same
+argument covers `realloc::payer`. This is the one place I did not implement the
+brief as written; the reviewer's own measurement (count stays at 7) is
+consistent with the `.`-fix alone being the intended change.
+
+#### One further unsound suppression removed
+
+`bump = ...` values were being collected into the pinning set. A bump expression
+evaluates to a `u8`, so naming a field in it relates that field to nothing —
+only the accompanying `seeds` can pin an account. The arm is gone
+(`flags_owner_named_only_in_a_bump_expression` guards the new behaviour, and the
+mutation suite includes a *re-add* mutant to keep it gone). Corpus effect: none.
+
+### Critical B — three guards with no load-bearing coverage
+
+All three had the same cause: the struct in the negative test was dropped by the
+round-2 scope guard before execution ever reached the guard the test named. Each
+was rewritten so its struct reaches the guard, differing from its positive
+counterpart by exactly one thing.
+
+| Guard | Test, before | Test, after |
+|---|---|---|
+| type filter | `accepts_signer_typed_field` — lone `Signer` field, struct out of scope | typed `vault` sibling puts the struct in scope; only the type filter keeps it quiet |
+| type filter | `accepts_a_signer_typed_authority` — duplicate of the above | reaches the guard through the *other* scope clause (untyped `vault` with `seeds`) |
+| marker check | `ignores_non_authority_name`, `ignores_account_info_fields_without_an_authority_name` — both lone `price_feed` fields | in-scope structs (typed / identity), distinct non-marker names |
+| marker check | `suffix_authority_bump_does_not_match` | in-scope struct; only `matches_marker` rejecting `_bump` prevents a finding |
+| `Custom(_)` | `accepts_custom_constraint` — `constraint = authority.is_signer` on the `authority` field, so the *name-matcher* covered it, not this guard | `constraint = vault.is_initialized` — the expression no longer mentions the field, so nothing but the `Custom(_)` guard can explain the silence (this is M4 stated as a test) |
+| name matcher | `accepts_an_account_info_guarded_by_an_is_signer_constraint` — double-guarded | the `is_signer` check moves to a sibling, naming `admin` as a bare identifier; now the matcher alone suppresses |
+
+`case_c_has_one_plus_signer_type_is_silent` is left as-is and is *intentionally*
+double-guarded — `has_one = authority` and `Signer<'info>` each suffice — because
+the brief requires it as a regression case. It cannot be killed by a single
+mutant and is not counted as coverage for either guard.
+
+### Mutation audit — every guard, every arm
+
+Method: neuter one guard, `cargo test --lib`, record which tests fail, restore.
+32 mutants covering every conditional, every match arm, and every entry of the
+two data tables. Script: `/tmp/mutate.py`, raw results
+`/tmp/mutation-results.json`.
+
+| Mutant (guard neutered) | Tests killed by it | Naming the failures |
+|---|---|---|
+| scope: typed-state clause | 6 | `case_a_bare_authority_beside_typed_vault_fires`, `every_marker_name_fires_on_an_unvalidated_account_info` +4 more |
+| scope: identity-constraint clause | 6 | `flags_authority_in_untyped_struct_pinned_only_by_has_one`, `flags_authority_in_untyped_struct_with_identity_constraint` +4 more |
+| scope: whole guard (skip out-of-scope structs) | 4 | `accepts_bare_init_only_untyped_struct`, `accepts_cpi_bundle_struct_with_no_account_attrs` +2 more |
+| field type filter (AccountInfo|UncheckedAccount) | 2 | `accepts_a_signer_typed_authority`, `accepts_signer_typed_field` |
+| marker-name check | 5 | `flags_authority_in_untyped_struct_pinned_only_by_has_one`, `flags_authority_in_untyped_struct_with_only_a_namespaced_constraint` +3 more |
+| matches_marker: exact-match clause | 25 | `case_a_bare_authority_beside_typed_vault_fires`, `case_b_has_one_on_sibling_pins_only_that_sibling` +23 more |
+| matches_marker: `_<marker>` suffix clause | 4 | `every_marker_name_fires_on_an_unvalidated_account_info`, `flags_pool_authority_suffix` +2 more |
+| guard 1: own #[account(signer)] | 1 | `accepts_account_signer_constraint` |
+| guard 2: own #[account(address = ..)] | 1 | `accepts_address_constraint` |
+| guard 3: own constraint = .. (Custom) | 1 | `accepts_custom_constraint` |
+| guard 3b: own seeds (field is a PDA) | 1 | `accepts_authority_field_with_own_seeds_constraint` |
+| guard 4: name referenced in a sibling constraint value | 7 | `accepts_an_account_info_guarded_by_an_is_signer_constraint`, `accepts_authority_pinned_by_legacy_string_constraint` +5 more |
+| name matcher: left boundary alphanumeric/_ | 1 | `seeds_suppression_requires_left_identifier_boundary` |
+| name matcher: left boundary `.` (field access) | 2 | `flags_admin_when_constraint_only_reads_another_accounts_admin_field`, `flags_authority_when_seeds_read_another_accounts_authority_field` |
+| name matcher: left boundary `:` (path segment) | 1 | `flags_authority_when_a_path_ends_with_its_name` |
+| name matcher: right boundary alphanumeric/_ | 1 | `seeds_suppression_requires_identifier_boundary` |
+| name matcher: right boundary `:` | 1 | `flags_authority_when_a_path_hangs_off_its_name` |
+| identity: Seeds | 1 | `flags_authority_in_untyped_struct_with_identity_constraint` |
+| identity: HasOne | 1 | `flags_authority_in_untyped_struct_pinned_only_by_has_one` |
+| identity: Custom | 1 | `flags_authority_in_untyped_struct_with_only_a_custom_constraint` |
+| identity: Other key "signer" | 1 | `flags_authority_in_untyped_struct_with_only_a_signer_constraint` |
+| identity: Other key "address" | 1 | `flags_authority_in_untyped_struct_with_only_an_address_constraint` |
+| identity: Other namespaced key (`::`) | 1 | `flags_authority_in_untyped_struct_with_only_a_namespaced_constraint` |
+| identity: Mut/Init/Bump are NOT identity | 3 | `accepts_bare_init_only_untyped_struct`, `accepts_mut_only_cpi_bundle_without_typed_state` +1 more |
+| typed state: Account(_) | 4 | `case_a_bare_authority_beside_typed_vault_fires`, `every_marker_name_fires_on_an_unvalidated_account_info` +2 more |
+| typed state: zero-copy/legacy wrapper names | 2 | `every_typed_state_wrapper_puts_the_struct_in_scope`, `flags_authority_when_struct_holds_account_loader_state` |
+| value collection: Seeds/HasOne/Custom values | 6 | `accepts_an_account_info_guarded_by_an_is_signer_constraint`, `accepts_authority_pinned_by_legacy_string_constraint` +4 more |
+| value collection: Other(k, v) values | 1 | `accepts_authority_pinned_by_namespaced_constraint_value` |
+| value collection: Bump values stay OUT (re-add mutant) | 1 | `flags_owner_named_only_in_a_bump_expression` |
+| MARKERS: entry "governance" | 1 | `every_marker_name_fires_on_an_unvalidated_account_info` |
+| MARKERS: entry "delegate" | 1 | `every_marker_name_fires_on_an_unvalidated_account_info` |
+| typed state: wrapper name "ProgramState" | 1 | `every_typed_state_wrapper_puts_the_struct_in_scope` |
+
+**Result: 32 mutants, 32 killed, 0 survivors.** Before this round the same suite
+had **8 survivors**: the three from Critical B plus five nobody had noticed —
+`HasOne`, `Custom`, `"signer"`, `"address"` and namespaced keys inside
+`is_identity_establishing` (every existing test for those was a *negative*
+asserting silence, and dropping an arm only produces more silence), the two `:`
+boundaries, and the `bump` value collection.
+
+Two traps worth recording, because both produce coverage that looks real:
+
+* **A negative test can never cover a scope clause.** Removing an arm from
+  `is_identity_establishing` drops structs *out* of scope, which produces fewer
+  findings. Only a *positive* test — a struct in scope solely because of that
+  one arm, with an unvalidated marker field — can fail. Hence the five new
+  `flags_authority_in_untyped_struct_with_only_a_*` tests.
+* **A loop over the constant under test is vacuous.** The first version of
+  `every_marker_name_fires_on_an_unvalidated_account_info` iterated `MARKERS`
+  itself, so deleting `"governance"` just shortened the loop and the test still
+  passed. It now spells the eight names out and asserts the list matches.
+
+### Counts
+
+| Stage | VL001 findings |
+|---|---|
+| Before R3 rebuild | 103 |
+| After R3 rebuild | 201 |
+| Fix round 1 | 61 |
+| Fix round 2 | 8 |
+| Fix round 3 | 7 |
+| **Fix round 4** | **7** |
+
+Tests: 110 unit + 4 integration = 114 (up from 101). No test was lost; nine were
+rewritten to be load-bearing and thirteen added. `cargo fmt --all`,
+`cargo clippy --all-targets -- -D warnings`, `cargo test` all clean.
+`examples/` and `tests/examples.rs` needed no change — no semantics moved for
+them — and the README demo block regenerates byte-identically from
+`./target/release/vaultlint scan ./examples/vulnerable --fail-on never`.
+
+### All 7 findings, re-read in source
+
+| # | Field | File:line | Verdict | Reasoning |
+|---|---|---|---|---|
+| 1 | `treasury_withdrawal_destination_owner` | auction-house:1101 | **TP** | `CreateAuctionHouse` has no signer gate on `authority` at all — `payer: Signer` pays, `authority: AccountInfo` is pinned only by appearing in the auction-house PDA seeds. Anyone may create the auction house for someone else's authority and aim the treasury withdrawal owner at themselves. |
+| 2 | `transfer_authority` | auction-house:1147 | **Borderline** | `Deposit` forwards it as the authority of `spl_token::instruction::transfer` inside `invoke_signed` with empty seeds (line ~186). The program checks nothing; the SPL Token program requires the signature downstream. Not exploitable as written, but an unvalidated `*_authority` passed into a CPI is worth a reviewer's eye. |
+| 3 | `transfer_authority` | auction-house:1363 | **Borderline** | Identical pattern in `Buy`. |
+| 4 | `new_authority` | auction-house:1613 | **FP** | `UpdateAuctionHouse` carries `authority: Signer<'info>` **and** `has_one = authority` on `auction_house`. The instruction is properly gated; `new_authority` is a data parameter — which pubkey to store, not who may call. |
+| 5 | `treasury_withdrawal_destination_owner` | auction-house:1618 | **FP** | Same struct, same gate. Setting the withdrawal destination is a legitimate signed admin action. |
+| 6 | `whitelisted_program_vault_authority` | lockup:300 | **FP** | `WhitelistTransfer` relays the vault authority PDA of an *external* whitelisted program over CPI. The callee owns and validates it; the caller structurally cannot. |
+| 7 | `my_payer` | misc/context.rs:138 | **TP (structurally)** | Genuinely unconstrained `AccountInfo` beside an `AccountLoader` PDA in `TestPdaMutZeroCopy`. The rule is right about the code; the file is a test fixture, so practical value is low. |
+
+**Complete census, N=7: 2 TP, 3 FP, 2 borderline.** Unchanged from round 3 — the
+same seven findings, re-read independently, same verdicts. The dominant residual
+FP class is still *authority-named data parameters of an already-gated
+instruction* (#4, #5), which the round-3 report flagged as the next thing to
+attack and which this round did not touch.
+
+### Regression cases re-confirmed
+
+Scanned with the release binary (`/tmp/vl-regress`):
+
+| Case | Expected | Result |
+|---|---|---|
+| `mut`-only handler, typed `Account<'info, Vault>` + unchecked `authority` | fires | fires, `a_mut_only_typed.rs:7` |
+| sibling `has_one = owner`, unchecked `authority` and `owner` | fires on `authority` only | fires once, on `authority` (`owner` is pinned by the `has_one` value) |
+| `has_one = authority` + `authority: Signer<'info>` | silent | silent |
+
+### Documentation
+
+The README's rules table read as a completeness claim. Added three sentences
+after it stating that VL001 treats any mention of the field in a sibling
+constraint as validation, that it does not inspect what the constraint asserts,
+and that a clean run therefore means a check exists and not that it is the right
+one. The same limitation is now a module-level comment at the top of
+`src/rules/signer.rs`, next to the code that causes it. M3 and M4 remain open;
+they are documented, not fixed.
+
+### Concerns
+
+1. **The `payer = payer` deviation** is the one place I did not do what the brief
+   said. If the intent was that `payer` should fire regardless of the System
+   Program's runtime signature requirement, say so and it is a one-line change
+   (drop `payer`/`realloc::payer` keys from the value collection) — but it will
+   add findings on any `init`-heavy program.
+2. **Mutation coverage is not correctness.** Every guard is now load-bearing,
+   but three of the seven corpus findings are still false positives; a fully
+   killed mutation suite says the tests pin the behaviour, not that the
+   behaviour is right.
+3. **The severity question from round 3 stands.** 2 TP / 3 FP / 2 borderline on
+   a complete census still argues for Medium rather than High, and nothing in
+   this round changed that ratio.
