@@ -220,3 +220,154 @@ Two notes on the table:
   passes with VL001 at `Medium`. No change was needed there.
 - README, `docs/`, and `docs/rule-pages.md` are untouched, as instructed — they still
   describe VL001 as "missing signer check" and will be wrong until the docs task lands.
+
+---
+
+# Fix round 1 — T5, S4 and the forwarding hop widened together
+
+Status: **DONE**. The T5 mismatch above is resolved. The decision was taken: T5 now also
+accepts the bare field name, and — the part that mattered — S4 and the forwarding hop were
+widened in the *same* change, so the two searches still see the same set of spellings.
+
+## What changed
+
+`src/rules/init_authority.rs` only. One new concept, `LinkedBody::spellings(field)`,
+returning the two ways this struct's field can be named in a linked body:
+
+- the fully qualified `<binding>.accounts.<F>` / `self.<F>`;
+- the bare `<F>` a handler gets from binding the field to a local first.
+
+`LinkedBody::reads_field(field, member)` runs `reads` over both. Three call sites now go
+through it:
+
+| Site | Before | After |
+|---|---|---|
+| **T5** | `reads(text, base(F), "key()")` | `body.reads_field(F, "key()")` |
+| **S4 direct** | `reads(text, base(F), "is_signer")` | `body.reads_field(F, "is_signer")` |
+| **forwarding** | 4 spellings off `base(F)` | 8 — the same 4 off each of `spellings(F)` |
+
+The forwarding list therefore gained `authority`, `&authority`,
+`authority.to_account_info()` and `&authority.to_account_info()`, so the one-hop
+`get_fee_payer` suppression still fires when the handler aliases or destructures first.
+
+The whole-identifier boundary in `contains_access` is untouched and still applies to the
+bare spelling: a match preceded by `.` or `:` does not count, so `vault.authority.key()`
+does not satisfy T5. There is a test for that.
+
+**Why the looseness is acceptable, recorded on `spellings` in the source:** T5 is a "was
+the field actually used" filter, not the discriminator. The narrowness lives in T1–T4 — a
+raw `AccountInfo`/`UncheckedAccount`, authority-named, in a struct with an `init` field,
+whose name is a whole identifier in that `init` field's `seeds`. Very little reaches T5.
+And where the same looseness feeds S4 and the hop, it errs towards *silencing* findings on
+code that does check, which is the safe direction.
+
+T3 also gained a one-line comment recording that T4 subsumes it (T4 looks the field up
+among the very `init` fields T3 counts, so it cannot succeed on an empty list). It is kept
+as a cheap early-out; its redundancy is deliberate and deleting it changes no result. This
+is written down so a later reader does not read the redundancy as a bug.
+
+## Tests added
+
+Six, in a new "the field bound to a local first" section. Each trigger case is paired with
+its suppression case, because either alone would pass with the asymmetry still present.
+
+| Test | Expect |
+|---|---|
+| `a_destructured_binding_is_still_a_read_of_the_field` — the marginfi shape, `let MarginfiAccountInitializePda { authority, .. } = ctx.accounts;` then `authority.key()` | **1** |
+| `an_is_signer_check_on_a_destructured_binding_silences_the_finding` | 0 |
+| `an_aliased_local_is_still_a_read_of_the_field` — metaplex's `let authority = &ctx.accounts.authority;` | **1** |
+| `an_is_signer_check_on_an_aliased_local_silences_the_finding` | 0 |
+| `an_is_signer_check_one_call_away_from_an_aliased_local_silences_the_finding` — `get_fee_payer(authority, …)` on the alias | 0 |
+| `a_field_access_in_the_handler_does_not_satisfy_t5` — the handler only reads `…marginfi_group.vault.authority.key()` | 0 |
+
+`cargo test`: **111 passed, 0 failed** (107 lib + 4 integration), up from 105.
+`cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean.
+
+### Mutations proving the new tests can fail
+
+Each mutation was applied to the shipped source, `cargo test --lib init_authority` run,
+and the source restored byte-for-byte from a backup.
+
+| Mutation | Result |
+|---|---|
+| **S4 asymmetry.** `body.reads_field(field, "is_signer")` → `reads(&body.text, &body.base(field), "is_signer")` in `establishes_signer` — i.e. T5 widened, S4 left narrow, which is exactly the trap | **2 failed**, and precisely the two symmetry suppressions: `an_is_signer_check_on_an_aliased_local_silences_the_finding`, `an_is_signer_check_on_a_destructured_binding_silences_the_finding`. Both trigger tests still passed, so the pair isolates the asymmetry and nothing else. |
+| **T5 narrowed back.** `body.reads_field(&field.name, "key()")` → `reads(&body.text, &body.base(&field.name), "key()")` | **2 failed**: `a_destructured_binding_is_still_a_read_of_the_field`, `an_aliased_local_is_still_a_read_of_the_field`. This is the committed rule's behaviour, and it is the proof that it was silent on its own motivating bug. |
+| **Forwarding narrowed.** `for base in body.spellings(field)` → `for base in [body.base(field)]` in `forwarded_arguments` | **1 failed**: `an_is_signer_check_one_call_away_from_an_aliased_local_silences_the_finding`. |
+
+The first two mutations are inverses of each other and fail disjoint sets of tests, which
+is the point: neither the trigger tests nor the suppression tests alone would have caught
+the asymmetry.
+
+## Corpus measurement
+
+Release build, `vaultlint scan <repo> --format json --fail-on never`. Every repo listed was
+present; nothing was substituted.
+
+| Codebase | VL001 | previous round | file:line |
+|---|---|---|---|
+| `/tmp/vl-real/liquid-staking-program` | 0 | 0 | — |
+| `/tmp/vl-real/marginfi-v2` (HEAD `1f1f7a6`) | 0 | 0 | — |
+| `/tmp/vl-real/openbook-v2` | 0 | 0 | — |
+| `/tmp/vl-real/protocol-v2` (drift) | 2 | 2 | `programs/drift/src/instructions/user.rs:4530`, `:5225` |
+| `/tmp/vl-real/squads-mpl` | 0 | 0 | — |
+| `/tmp/anchor-check` | **1** | 0 | `tests/auction-house/programs/auction-house/src/lib.rs:1098` |
+| `/tmp/vl-marginfi-prefix` (marginfi @ `95a4c26^`) | **1** | *not measured* | `programs/marginfi/src/instructions/marginfi_account/initialize.rs:114` |
+
+This reproduces the brief's table exactly and matches the prediction the previous round
+measured: **one** new finding, in `anchor-check`, and **zero** new findings anywhere else.
+The two drift findings are unchanged and are the same pair as before
+(`InitializeSignedMsgUserOrders.authority`, `InitializeRevenueShare.authority`).
+
+`/tmp/anchor-check` line 1098 is `authority: AccountInfo<'info>` in
+`pub struct CreateAuctionHouse<'info>` (declared at line 1094) — the finding the brief
+named, now present.
+
+### The marginfi before/after pair
+
+This is the evidence the rule exists for, so it is spelled out in full.
+
+No pre-fix worktree existed, so one was created and left in place for later tasks:
+
+```
+cd /tmp/vl-real/marginfi-v2 && git worktree add /tmp/vl-marginfi-prefix 95a4c26^
+# → detached HEAD 40e16b7 "Asgard cpi key"
+```
+
+| Tree | VL001 |
+|---|---|
+| `/tmp/vl-marginfi-prefix` — `95a4c26^` (`40e16b7`), pre-fix | **1** — `programs/marginfi/src/instructions/marginfi_account/initialize.rs:114`, `pub authority: UncheckedAccount<'info>,` |
+| `/tmp/vl-real/marginfi-v2` — HEAD `1f1f7a6`, post-fix | **0** |
+
+Line 114 in the pre-fix tree is exactly the line the fix commit changed. `git show 95a4c26`
+touches one file, three insertions and three deletions, and the authority hunk is verbatim:
+
+```
+-    pub authority: UncheckedAccount<'info>,
++    pub authority: Signer<'info>,
+```
+
+The handler at line 61 of that file destructures —
+
+```rust
+let MarginfiAccountInitializePda { authority, marginfi_group, marginfi_account: marginfi_account_loader, .. } = ctx.accounts;
+…
+marginfi_account.initialize(marginfi_group.key(), authority.key());
+```
+
+— which is precisely the shape the committed rule could not see, and is now covered both
+by the corpus run and by `a_destructured_binding_is_still_a_read_of_the_field`.
+
+The rule fires on the vulnerable commit, on the exact line the developers fixed, and is
+silent on the fixed commit. Nothing was tuned to produce this: the widening was specified
+before the pre-fix tree was ever scanned, and the only knob touched was the spelling set.
+
+## Concerns
+
+None blocking. Two things worth knowing:
+
+- **The bare spelling can alias an unrelated local.** A handler with an unrelated
+  `let owner = …` would satisfy T5 for a field named `owner`. That is the accepted cost,
+  and it is bounded: T1–T4 must all hold first, and on this corpus the widening produced
+  exactly one additional finding — the intended one. Not worth chasing with dataflow.
+- The `/tmp/vl-marginfi-prefix` worktree is left registered against `/tmp/vl-real/marginfi-v2`.
+  If a later task wants the tree clean, `git worktree remove /tmp/vl-marginfi-prefix`.
