@@ -1,3 +1,13 @@
+//! VL001 — an authority-named raw account that nothing in the struct validates.
+//!
+//! Known limitation, stated here because it is a soundness hole and not a
+//! tuning choice: a field counts as validated as soon as its name is mentioned
+//! in *any* constraint on *any* field of the same struct, and the rule never
+//! asks what that constraint asserts.  A decoy `seeds` reference on an
+//! unrelated account, or a vacuous `constraint = ...`, therefore silences it.
+//! Both are documented in the README; closing them needs dataflow this model
+//! does not carry.
+
 use crate::anchor::{AccountTy, Constraint};
 use crate::finding::{Finding, Severity};
 use crate::rules::{Rule, RuleContext};
@@ -23,27 +33,44 @@ fn matches_marker(name: &str, marker: &str) -> bool {
     name == marker || name.ends_with(&format!("_{marker}"))
 }
 
-/// Returns true if `field_name` appears as a whole identifier inside `seeds_text`.
+/// Returns true if `field_name` appears in `constraint_text` as a reference to
+/// the field itself — a bare identifier, not part of a longer name, not the
+/// member of a field access, and not a segment of a path.
 ///
-/// We check for identifier boundaries so that `authority` is not matched inside
-/// `authority_bump` or `pool_authority_seed`.
-fn name_in_seeds(field_name: &str, seeds_text: &str) -> bool {
-    let bytes = seeds_text.as_bytes();
+/// Boundaries, and why each one is there:
+///
+/// * alphanumeric / `_` on either side — `authority` must not match inside
+///   `authority_bump` or `pool_authority`.
+/// * `.` on the **left** — `vault.authority` reads the *vault's* stored pubkey.
+///   It says nothing about the `authority` account we were handed, so it must
+///   not suppress the rule. (`.` on the **right** is fine and common:
+///   `authority.key()` really is a use of our field.)  Anchor expands
+///   `#[account(...)]` expressions where the struct's fields are bare locals, so
+///   neither `self.authority` nor `ctx.accounts.authority` is valid syntax
+///   there — excluding a `.`-prefixed match therefore loses no real reference.
+/// * `:` on **either** side — `config::authority::ID` is a module path whose
+///   segment happens to share the name; a field can neither be reached through
+///   `::` nor have items hung off it.
+fn name_in_seeds(field_name: &str, constraint_text: &str) -> bool {
+    let bytes = constraint_text.as_bytes();
     let n = field_name.len();
-    let text = seeds_text;
+    let text = constraint_text;
 
     let mut start = 0;
     while let Some(pos) = text[start..].find(field_name) {
         let abs = start + pos;
-        // Check left boundary: must be start of string or a non-identifier char.
+        // Check left boundary: must be start of string, or a character that can
+        // neither continue an identifier (`a-z`, `_`) nor introduce one as a
+        // member (`.`) or a path segment (`:`).
         let left_ok = abs == 0 || {
             let c = text.as_bytes()[abs - 1] as char;
-            !c.is_alphanumeric() && c != '_'
+            !c.is_alphanumeric() && c != '_' && c != '.' && c != ':'
         };
         // Check right boundary: must be end of string or a non-identifier char.
+        // `:` is excluded as well, so `authority::ID` is read as a path.
         let right_ok = abs + n >= bytes.len() || {
             let c = bytes[abs + n] as char;
-            !c.is_alphanumeric() && c != '_'
+            !c.is_alphanumeric() && c != '_' && c != ':'
         };
         if left_ok && right_ok {
             return true;
@@ -151,7 +178,10 @@ impl Rule for MissingSignerCheck {
                             Some(v.as_str())
                         }
                         Constraint::Other(_, v) if !v.is_empty() => Some(v.as_str()),
-                        Constraint::Bump(Some(v)) => Some(v.as_str()),
+                        // `Bump(_)` is deliberately absent: a bump expression
+                        // evaluates to a `u8`, so naming a field in it relates
+                        // that field to nothing.  Only the accompanying `seeds`
+                        // can pin an account.
                         _ => None,
                     })
                 })
@@ -308,21 +338,93 @@ mod tests {
         assert_eq!(findings.len(), 1);
     }
 
+    /// Every entry of `MARKERS` is load-bearing, in both its bare and its
+    /// `<prefix>_<marker>` form.  The list is spelled out here rather than read
+    /// from `MARKERS`, so that deleting an entry from the rule breaks the test.
+    #[test]
+    fn every_marker_name_fires_on_an_unvalidated_account_info() {
+        let expected = [
+            "authority",
+            "admin",
+            "owner",
+            "signer",
+            "payer",
+            "delegate",
+            "manager",
+            "governance",
+        ];
+        assert_eq!(MARKERS, &expected, "MARKERS changed; update this test");
+        for marker in expected {
+            for name in [marker.to_string(), format!("pool_{marker}")] {
+                let source = format!(
+                    r#"
+                    #[derive(Accounts)]
+                    pub struct Ctx<'info> {{
+                        #[account(mut)]
+                        pub vault: Account<'info, Vault>,
+                        /// CHECK: unvalidated
+                        pub {name}: AccountInfo<'info>,
+                    }}
+                "#
+                );
+                let findings = findings_for(&source, &MissingSignerCheck);
+                assert_eq!(findings.len(), 1, "`{name}` did not fire: {findings:?}");
+                assert!(findings[0].message.contains(&name));
+            }
+        }
+    }
+
+    /// Every typed-state wrapper name is load-bearing: each one on its own puts
+    /// an otherwise unconstrained struct in scope.
+    #[test]
+    fn every_typed_state_wrapper_puts_the_struct_in_scope() {
+        for wrapper in [
+            "AccountLoader",
+            "Loader",
+            "ProgramAccount",
+            "CpiAccount",
+            "ProgramState",
+        ] {
+            let source = format!(
+                r#"
+                #[derive(Accounts)]
+                pub struct Ctx<'info> {{
+                    #[account(mut)]
+                    pub vault: {wrapper}<'info, Vault>,
+                    /// CHECK: unvalidated
+                    pub authority: AccountInfo<'info>,
+                }}
+            "#
+            );
+            let findings = findings_for(&source, &MissingSignerCheck);
+            assert_eq!(findings.len(), 1, "`{wrapper}` out of scope: {findings:?}");
+        }
+    }
+
     // ── negative: `Signer<'info>` type — out of scope entirely ───────────────
 
+    /// The typed `vault` puts the struct in scope and nothing names `authority`,
+    /// so the *only* reason this is silent is the type filter.  Differs from
+    /// `flags_authority_when_struct_holds_typed_state_account` by one token: the
+    /// type of `authority`.
     #[test]
     fn accepts_signer_typed_field() {
         let findings = findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
+                #[account(mut)]
+                pub vault: Account<'info, Vault>,
                 pub authority: Signer<'info>,
             }
         "#,
             &MissingSignerCheck,
         );
 
-        assert!(findings.is_empty());
+        assert!(
+            findings.is_empty(),
+            "expected no findings, got {findings:?}"
+        );
     }
 
     // ── negative: `#[account(signer)]` constraint ────────────────────────────
@@ -363,20 +465,30 @@ mod tests {
 
     // ── negative: `#[account(constraint = ...)]` constraint ──────────────────
 
+    /// The field carries its own `constraint = ...`, so the `Custom(_)` guard
+    /// suppresses it.  The expression deliberately does *not* mention
+    /// `authority`, so no other guard can account for the silence — this is the
+    /// M4 limitation stated plainly: any `constraint` is taken at face value.
+    /// Counterpart: `flags_authority_when_struct_holds_typed_state_account`.
     #[test]
     fn accepts_custom_constraint() {
         let findings = findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
-                #[account(constraint = authority.is_signer)]
+                #[account(mut)]
+                pub vault: Account<'info, Vault>,
+                #[account(constraint = vault.is_initialized)]
                 pub authority: AccountInfo<'info>,
             }
         "#,
             &MissingSignerCheck,
         );
 
-        assert!(findings.is_empty());
+        assert!(
+            findings.is_empty(),
+            "expected no findings, got {findings:?}"
+        );
     }
 
     // ── negative: sibling `has_one = authority` ───────────────────────────────
@@ -419,37 +531,54 @@ mod tests {
 
     // ── negative: non-authority name is ignored ───────────────────────────────
 
+    /// In scope (typed `vault`), an unvalidated `AccountInfo` — only the marker
+    /// list keeps this quiet.  Counterpart:
+    /// `flags_authority_when_struct_holds_typed_state_account`.
     #[test]
     fn ignores_non_authority_name() {
         let findings = findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
+                #[account(mut)]
+                pub vault: Account<'info, Vault>,
+                /// CHECK: price oracle, not an authority
                 pub price_feed: AccountInfo<'info>,
             }
         "#,
             &MissingSignerCheck,
         );
 
-        assert!(findings.is_empty());
+        assert!(
+            findings.is_empty(),
+            "expected no findings, got {findings:?}"
+        );
     }
 
     // ── boundary: `authority_bump` must NOT match `_authority` or `authority` ─
 
+    /// `authority_bump` ends with `_bump`, not `_authority`, so `matches_marker`
+    /// rejects it.  The struct is in scope, so the marker check is the only
+    /// thing standing between this field and a finding.
     #[test]
     fn suffix_authority_bump_does_not_match() {
-        // `authority_bump` ends with `_bump`, not `_authority`, so no match.
         let findings = findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
+                #[account(mut)]
+                pub vault: Account<'info, Vault>,
+                /// CHECK: seed material, not an account authority
                 pub authority_bump: AccountInfo<'info>,
             }
         "#,
             &MissingSignerCheck,
         );
 
-        assert!(findings.is_empty());
+        assert!(
+            findings.is_empty(),
+            "expected no findings, got {findings:?}"
+        );
     }
 
     // ── seeds identifier boundary: `authority_bump` in seeds must NOT suppress
@@ -472,6 +601,109 @@ mod tests {
         );
 
         assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("authority"));
+    }
+
+    // ── identifier boundaries: a *field access* on another account is not a
+    //    reference to our own field ────────────────────────────────────────────
+
+    /// The seeds pin the vault to the authority pubkey it already stores.
+    /// `vault.authority` reads the *vault's* field; the passed-in `authority`
+    /// account is validated by nothing and must fire.
+    #[test]
+    fn flags_authority_when_seeds_read_another_accounts_authority_field() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct Withdraw<'info> {
+                #[account(seeds = [b"vault", vault.authority.as_ref()], bump)]
+                pub vault: Account<'info, Vault>,
+                /// CHECK: unvalidated
+                pub authority: AccountInfo<'info>,
+            }
+        "#,
+            &MissingSignerCheck,
+        );
+        assert_eq!(findings.len(), 1, "expected 1 finding, got {findings:?}");
+        assert!(findings[0].message.contains("authority"));
+    }
+
+    /// A sibling's constraint merely *reads* `cfg.admin`; it does not relate the
+    /// `admin` account we were handed to anything.
+    #[test]
+    fn flags_admin_when_constraint_only_reads_another_accounts_admin_field() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct Update<'info> {
+                #[account(constraint = cfg.admin != Pubkey::default())]
+                pub cfg: Account<'info, Config>,
+                /// CHECK: unvalidated
+                pub admin: AccountInfo<'info>,
+            }
+        "#,
+            &MissingSignerCheck,
+        );
+        assert_eq!(findings.len(), 1, "expected 1 finding, got {findings:?}");
+        assert!(findings[0].message.contains("admin"));
+    }
+
+    /// A trailing path segment (`ids::authority`) names a constant, not our
+    /// field — `::` binds like `.` on the left of the match.
+    #[test]
+    fn flags_authority_when_a_path_ends_with_its_name() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct Withdraw<'info> {
+                #[account(constraint = cfg.owner == ids::authority)]
+                pub cfg: Account<'info, Config>,
+                /// CHECK: unvalidated
+                pub authority: AccountInfo<'info>,
+            }
+        "#,
+            &MissingSignerCheck,
+        );
+        assert_eq!(findings.len(), 1, "expected 1 finding, got {findings:?}");
+        assert!(findings[0].message.contains("authority"));
+    }
+
+    /// A leading path segment (`authority::ID`) is a module — nothing can be
+    /// hung off an account field with `::`, so this pins nothing.
+    #[test]
+    fn flags_authority_when_a_path_hangs_off_its_name() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct Withdraw<'info> {
+                #[account(address = authority::ID)]
+                pub cfg: Account<'info, Config>,
+                /// CHECK: unvalidated
+                pub authority: AccountInfo<'info>,
+            }
+        "#,
+            &MissingSignerCheck,
+        );
+        assert_eq!(findings.len(), 1, "expected 1 finding, got {findings:?}");
+        assert!(findings[0].message.contains("authority"));
+    }
+
+    /// Left identifier boundary: seeds naming `pool_authority` do not pin a
+    /// field called `authority`.
+    #[test]
+    fn seeds_suppression_requires_left_identifier_boundary() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct Withdraw<'info> {
+                #[account(seeds = [b"vault", pool_authority.key().as_ref()], bump)]
+                pub vault: Account<'info, Vault>,
+                pub authority: AccountInfo<'info>,
+            }
+        "#,
+            &MissingSignerCheck,
+        );
+        assert_eq!(findings.len(), 1, "expected 1 finding, got {findings:?}");
         assert!(findings[0].message.contains("authority"));
     }
 
@@ -634,6 +866,138 @@ mod tests {
             findings.is_empty(),
             "expected no findings for untyped bare-init struct, got {findings:?}"
         );
+    }
+
+    /// A field named inside a `bump = ...` expression is not thereby validated:
+    /// the expression yields a `u8`, and the seeds — which are what actually
+    /// pin the PDA — never mention `owner`.
+    #[test]
+    fn flags_owner_named_only_in_a_bump_expression() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct Release<'info> {
+                #[account(mut, seeds = [b"escrow"], bump = escrow.bump_for(owner))]
+                pub escrow: Account<'info, Escrow>,
+                /// CHECK: unvalidated
+                pub owner: AccountInfo<'info>,
+            }
+        "#,
+            &MissingSignerCheck,
+        );
+        assert_eq!(findings.len(), 1, "expected 1 finding, got {findings:?}");
+        assert!(findings[0].message.contains("owner"));
+    }
+
+    // ── the identity clause, one constraint kind at a time ──────────────────
+    //
+    // Each of these structs is untyped, so `is_identity_establishing` is the
+    // only thing that can put it in scope, and each carries exactly one kind of
+    // identity constraint.  Drop that kind from the classifier and the struct
+    // falls out of scope, the finding disappears, and the test fails.
+
+    /// `has_one` on a sibling is the only identity signal.
+    #[test]
+    fn flags_authority_in_untyped_struct_pinned_only_by_has_one() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct Withdraw<'info> {
+                #[account(mut, has_one = owner)]
+                /// CHECK: legacy raw vault
+                pub vault: UncheckedAccount<'info>,
+                /// CHECK: pinned by has_one
+                pub owner: AccountInfo<'info>,
+                /// CHECK: unvalidated
+                pub authority: AccountInfo<'info>,
+            }
+        "#,
+            &MissingSignerCheck,
+        );
+        assert_eq!(findings.len(), 1, "expected 1 finding, got {findings:?}");
+        assert!(findings[0].message.contains("authority"));
+    }
+
+    /// `constraint = ...` on a sibling is the only identity signal.
+    #[test]
+    fn flags_authority_in_untyped_struct_with_only_a_custom_constraint() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct Withdraw<'info> {
+                #[account(mut, constraint = vault.data_len() == 64)]
+                /// CHECK: legacy raw vault
+                pub vault: UncheckedAccount<'info>,
+                /// CHECK: unvalidated
+                pub authority: AccountInfo<'info>,
+            }
+        "#,
+            &MissingSignerCheck,
+        );
+        assert_eq!(findings.len(), 1, "expected 1 finding, got {findings:?}");
+        assert!(findings[0].message.contains("authority"));
+    }
+
+    /// `#[account(signer)]` on a sibling is the only identity signal.
+    #[test]
+    fn flags_authority_in_untyped_struct_with_only_a_signer_constraint() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct Withdraw<'info> {
+                #[account(signer)]
+                /// CHECK: must sign
+                pub cosigner: UncheckedAccount<'info>,
+                /// CHECK: unvalidated
+                pub authority: AccountInfo<'info>,
+            }
+        "#,
+            &MissingSignerCheck,
+        );
+        assert_eq!(findings.len(), 1, "expected 1 finding, got {findings:?}");
+        assert!(findings[0].message.contains("authority"));
+    }
+
+    /// `#[account(address = ...)]` on a sibling is the only identity signal.
+    #[test]
+    fn flags_authority_in_untyped_struct_with_only_an_address_constraint() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct Withdraw<'info> {
+                #[account(address = registry::ID)]
+                /// CHECK: pinned to a known address
+                pub registry: UncheckedAccount<'info>,
+                /// CHECK: unvalidated
+                pub authority: AccountInfo<'info>,
+            }
+        "#,
+            &MissingSignerCheck,
+        );
+        assert_eq!(findings.len(), 1, "expected 1 finding, got {findings:?}");
+        assert!(findings[0].message.contains("authority"));
+    }
+
+    /// A namespaced constraint (`token::mint = ...`) is the only identity signal.
+    #[test]
+    fn flags_authority_in_untyped_struct_with_only_a_namespaced_constraint() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct Withdraw<'info> {
+                #[account(token::mint = usdc_mint)]
+                /// CHECK: token account
+                pub pool_token: UncheckedAccount<'info>,
+                /// CHECK: mint
+                pub usdc_mint: UncheckedAccount<'info>,
+                /// CHECK: unvalidated
+                pub authority: AccountInfo<'info>,
+            }
+        "#,
+            &MissingSignerCheck,
+        );
+        assert_eq!(findings.len(), 1, "expected 1 finding, got {findings:?}");
+        assert!(findings[0].message.contains("authority"));
     }
 
     // ── in-scope signal: the struct owns typed program state ────────────────
@@ -939,49 +1303,78 @@ mod tests {
         assert!(findings[0].message.contains("authority"));
     }
 
+    /// Same guard as `accepts_signer_typed_field`, reached through the *other*
+    /// scope clause: no typed state anywhere, the struct is in scope only
+    /// because `vault` carries `seeds`.  Counterpart:
+    /// `flags_authority_in_untyped_struct_with_identity_constraint`.
     #[test]
     fn accepts_a_signer_typed_authority() {
         let findings = findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
+                #[account(mut, seeds = [b"vault"], bump)]
+                /// CHECK: PDA verified by seeds
+                pub vault: UncheckedAccount<'info>,
                 pub authority: Signer<'info>,
             }
         "#,
             &MissingSignerCheck,
         );
 
-        assert!(findings.is_empty());
+        assert!(
+            findings.is_empty(),
+            "expected no findings, got {findings:?}"
+        );
     }
 
+    /// The `is_signer` check lives on a *sibling*, and names `admin` as a bare
+    /// identifier — so the cross-field name matcher is what suppresses this, and
+    /// nothing else.  Contrast
+    /// `flags_admin_when_constraint_only_reads_another_accounts_admin_field`,
+    /// where the same sibling mentions `cfg.admin` and the rule fires.
     #[test]
     fn accepts_an_account_info_guarded_by_an_is_signer_constraint() {
         let findings = findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
-                #[account(constraint = admin.is_signer)]
+                #[account(mut, constraint = admin.is_signer)]
+                pub cfg: Account<'info, Config>,
+                /// CHECK: checked by the sibling constraint
                 pub admin: AccountInfo<'info>,
             }
         "#,
             &MissingSignerCheck,
         );
 
-        assert!(findings.is_empty());
+        assert!(
+            findings.is_empty(),
+            "expected no findings, got {findings:?}"
+        );
     }
 
+    /// Same guard as `ignores_non_authority_name`, reached through the identity
+    /// scope clause instead of the typed-state one.
     #[test]
     fn ignores_account_info_fields_without_an_authority_name() {
         let findings = findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
-                pub price_feed: AccountInfo<'info>,
+                #[account(mut, seeds = [b"vault"], bump)]
+                /// CHECK: PDA verified by seeds
+                pub vault: UncheckedAccount<'info>,
+                /// CHECK: metadata blob, not an authority
+                pub metadata: AccountInfo<'info>,
             }
         "#,
             &MissingSignerCheck,
         );
 
-        assert!(findings.is_empty());
+        assert!(
+            findings.is_empty(),
+            "expected no findings, got {findings:?}"
+        );
     }
 }
