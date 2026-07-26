@@ -79,6 +79,13 @@ Exit codes make it CI-ready: `0` when nothing exceeds the threshold, `1` when it
 Every rule is deliberately narrow. A linter that cries wolf on healthy code gets
 uninstalled the same day, so vaultlint prefers a missed finding to a false one.
 
+**VL001 has a known limitation.** It treats a field as validated as soon as the
+field's name is mentioned in any `#[account(...)]` constraint anywhere in the same
+struct, and it does not check what that constraint actually asserts — so an
+incidental mention (a `seeds` reference on an unrelated account, or a vacuous
+`constraint = ...`) is enough to silence it. A clean VL001 run means a check
+exists, not that it is the right one.
+
 Silence a specific finding with a comment on its own line, or anywhere in the
 block of comments and attributes directly above it:
 
