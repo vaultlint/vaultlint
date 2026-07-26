@@ -1,5 +1,6 @@
 pub mod arithmetic;
 pub mod owner;
+pub mod pda;
 pub mod signer;
 
 use std::path::Path;
@@ -70,6 +71,7 @@ pub fn all() -> Vec<Box<dyn Rule>> {
         Box::new(signer::MissingSignerCheck),
         Box::new(owner::MissingOwnerCheck),
         Box::new(arithmetic::UncheckedArithmetic),
+        Box::new(pda::UnvalidatedPdaBump),
     ]
 }
 
