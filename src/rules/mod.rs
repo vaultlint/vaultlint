@@ -1,3 +1,4 @@
+pub mod arithmetic;
 pub mod owner;
 pub mod signer;
 
@@ -68,6 +69,7 @@ pub fn all() -> Vec<Box<dyn Rule>> {
     vec![
         Box::new(signer::MissingSignerCheck),
         Box::new(owner::MissingOwnerCheck),
+        Box::new(arithmetic::UncheckedArithmetic),
     ]
 }
 
