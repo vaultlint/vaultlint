@@ -172,6 +172,19 @@ fn constraints(attrs: &[syn::Attribute]) -> Vec<Constraint> {
 
 fn to_constraint(item: attr::MetaItem) -> Constraint {
     let value = item.value.unwrap_or_default();
+
+    // Anchor's legacy syntax `#[account("<expr>")]` is the ancestor of today's
+    // `#[account(constraint = <expr>)]`.  A bare string literal parses into the
+    // key slot with no value, so recognise it here and normalise it to `Custom`;
+    // otherwise the expression — and every field name it references — is lost.
+    if value.is_empty()
+        && item.key.len() >= 2
+        && item.key.starts_with('"')
+        && item.key.ends_with('"')
+    {
+        return Constraint::Custom(item.key[1..item.key.len() - 1].to_string());
+    }
+
     match item.key.as_str() {
         "init" | "init_if_needed" => Constraint::Init,
         "mut" => Constraint::Mut,
@@ -315,6 +328,31 @@ mod tests {
         );
 
         assert_eq!(model.accounts_structs[0].fields[0].span.start().line, 3);
+    }
+
+    #[test]
+    fn parses_legacy_string_constraint_as_custom() {
+        // Anchor's legacy syntax `#[account("<expr>")]` is exactly today's
+        // `#[account(constraint = <expr>)]`. The bare string literal lands in the
+        // *key* slot with no value, so it must be recognised explicitly.
+        let model = model(
+            r#"
+            #[derive(Accounts)]
+            pub struct CreateMember<'info> {
+                #[account("&balances.spt.owner == member_signer.key")]
+                pub balances: BalanceSandboxAccounts<'info>,
+                pub member_signer: AccountInfo<'info>,
+            }
+        "#,
+        );
+
+        let balances = &model.accounts_structs[0].fields[0];
+        assert_eq!(
+            balances.constraints,
+            vec![Constraint::Custom(
+                "&balances.spt.owner==member_signer.key".to_string()
+            )]
+        );
     }
 
     #[test]
