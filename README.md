@@ -36,8 +36,8 @@ $ vaultlint scan ./examples/vulnerable
 
 ✗ HIGH  missing signer check
         ./examples/vulnerable/missing_signer.rs:8
-        `authority` is not constrained as Signer. Any account can be passed here.
-        Declare the field as `Signer<'info>`, or add `constraint = <account>.is_signer`.
+        `authority` is not validated. Any account can be passed here.
+        Declare the field as `Signer<'info>`, add `#[account(signer)]`, `#[account(address = expected::ID)]`, a `constraint = ...`, or ensure it is pinned by a PDA's seeds or a `has_one`.
 
 ⚠ MED  non-canonical PDA bump
         ./examples/vulnerable/pda_bump.rs:7
@@ -70,7 +70,7 @@ Exit codes make it CI-ready: `0` when nothing exceeds the threshold, `1` when it
 
 | ID | Severity | What it catches |
 |----|----------|-----------------|
-| [VL001](https://vaultlint.com/rules/VL001) | High | Authority accounts that are not constrained as `Signer` |
+| [VL001](https://vaultlint.com/rules/VL001) | High | Authority-named `AccountInfo`/`UncheckedAccount` fields with no signer, address, constraint, seeds, or `has_one` validation |
 | [VL002](https://vaultlint.com/rules/VL002) | High | Account data deserialised without an owner check |
 | [VL003](https://vaultlint.com/rules/VL003) | Medium | Unchecked `+ - *` written into account state |
 | [VL004](https://vaultlint.com/rules/VL004) | Medium | PDAs validated with a caller-supplied bump (`bump = <instruction arg>`) |
