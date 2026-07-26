@@ -6,11 +6,13 @@ pub mod report;
 pub mod rules;
 pub mod scan;
 pub mod suppress;
+pub mod usesite;
 
 use std::path::PathBuf;
 
 use finding::Finding;
-use rules::RuleContext;
+use rules::{LinkedContext, RuleContext};
+use usesite::UseSiteIndex;
 
 pub struct ScanOptions {
     pub root: PathBuf,
@@ -31,10 +33,15 @@ pub struct ScanReport {
 pub fn scan(options: &ScanOptions) -> ScanReport {
     let project = project::detect(&options.root);
     let rules = rules::all();
+    let linked_rules = rules::linked_all();
     let mut findings = Vec::new();
     let mut skipped = Vec::new();
     let mut files_scanned = 0;
+    let mut index = UseSiteIndex::empty();
+    let mut linked_files = Vec::new();
 
+    // Phase 1: run the file-local rules and record the facts the linked rules
+    // will need. The AST is dropped as each file finishes.
     for path in scan::rust_files(&options.root) {
         match parse::parse(&path) {
             Ok(file) => {
@@ -53,12 +60,39 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
                 }
                 file_findings.retain(|finding| !suppress::is_suppressed(&file.source, finding));
                 findings.append(&mut file_findings);
+
+                if !anchor.accounts_structs.is_empty() {
+                    linked_files.push(file.path.clone());
+                }
+                index.insert(&file.path, usesite::collect_facts(&file.ast));
             }
             Err(error) => skipped.push(SkippedFile {
                 path,
                 reason: error.to_string(),
             }),
         }
+    }
+
+    // Phase 2: only files declaring an `Accounts` struct can produce a linked
+    // finding, and that is a small fraction of any repo. A file phase 1 already
+    // accepted is never reported as skipped a second time.
+    for path in &linked_files {
+        let Ok(file) = parse::parse(path) else {
+            continue;
+        };
+        let anchor = anchor::build(&file.ast);
+        let ctx = LinkedContext {
+            path: &file.path,
+            source: &file.source,
+            anchor: &anchor,
+            index: &index,
+        };
+        let mut file_findings = Vec::new();
+        for rule in &linked_rules {
+            rule.check(&ctx, &mut file_findings);
+        }
+        file_findings.retain(|finding| !suppress::is_suppressed(&file.source, finding));
+        findings.append(&mut file_findings);
     }
 
     // Most severe first, then stable by location — one ordering for every renderer.

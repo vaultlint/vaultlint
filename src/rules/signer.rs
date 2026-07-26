@@ -10,7 +10,7 @@
 
 use crate::anchor::{AccountTy, Constraint};
 use crate::finding::{Finding, Severity};
-use crate::rules::{Rule, RuleContext};
+use crate::rules::{LinkedContext, LinkedRule};
 
 /// Field names that imply the account authorises the instruction.
 /// Kept deliberately short: a missed unusual name costs nothing,
@@ -128,12 +128,12 @@ fn is_typed_state(ty: &AccountTy) -> bool {
     }
 }
 
-impl Rule for MissingSignerCheck {
+impl LinkedRule for MissingSignerCheck {
     fn id(&self) -> &'static str {
         "VL001"
     }
 
-    fn check(&self, ctx: &RuleContext<'_>, out: &mut Vec<Finding>) {
+    fn check(&self, ctx: &LinkedContext<'_>, out: &mut Vec<Finding>) {
         for accounts in &ctx.anchor.accounts_structs {
             // Decide whether this struct is an instruction context for *this*
             // program at all.  Two independent signals put it in scope:
@@ -273,7 +273,7 @@ impl Rule for MissingSignerCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::findings_for;
+    use crate::rules::linked_findings_for;
 
     // ── positive: bare authority-named AccountInfo with no constraints ────────
     //    The sibling vault has `seeds` (identity-establishing) so the struct is
@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn flags_bare_authority_account_info() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn flags_pool_authority_suffix() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn flags_vault_authority_suffix() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Transfer<'info> {
@@ -367,7 +367,7 @@ mod tests {
                     }}
                 "#
                 );
-                let findings = findings_for(&source, &MissingSignerCheck);
+                let findings = linked_findings_for(&source, &MissingSignerCheck);
                 assert_eq!(findings.len(), 1, "`{name}` did not fire: {findings:?}");
                 assert!(findings[0].message.contains(&name));
             }
@@ -396,7 +396,7 @@ mod tests {
                 }}
             "#
             );
-            let findings = findings_for(&source, &MissingSignerCheck);
+            let findings = linked_findings_for(&source, &MissingSignerCheck);
             assert_eq!(findings.len(), 1, "`{wrapper}` out of scope: {findings:?}");
         }
     }
@@ -409,7 +409,7 @@ mod tests {
     /// type of `authority`.
     #[test]
     fn accepts_signer_typed_field() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -431,7 +431,7 @@ mod tests {
 
     #[test]
     fn accepts_account_signer_constraint() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn accepts_address_constraint() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -472,7 +472,7 @@ mod tests {
     /// Counterpart: `flags_authority_when_struct_holds_typed_state_account`.
     #[test]
     fn accepts_custom_constraint() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn accepts_has_one_target() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -514,7 +514,7 @@ mod tests {
 
     #[test]
     fn accepts_field_that_appears_in_seeds() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Initialize<'info> {
@@ -536,7 +536,7 @@ mod tests {
     /// `flags_authority_when_struct_holds_typed_state_account`.
     #[test]
     fn ignores_non_authority_name() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -562,7 +562,7 @@ mod tests {
     /// thing standing between this field and a finding.
     #[test]
     fn suffix_authority_bump_does_not_match() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -588,7 +588,7 @@ mod tests {
     fn seeds_suppression_requires_identifier_boundary() {
         // seeds contain `authority_bump`, which includes `authority` as substring
         // but not as a whole identifier. So `authority` must still be flagged.
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -612,7 +612,7 @@ mod tests {
     /// account is validated by nothing and must fire.
     #[test]
     fn flags_authority_when_seeds_read_another_accounts_authority_field() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -632,7 +632,7 @@ mod tests {
     /// `admin` account we were handed to anything.
     #[test]
     fn flags_admin_when_constraint_only_reads_another_accounts_admin_field() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Update<'info> {
@@ -652,7 +652,7 @@ mod tests {
     /// field — `::` binds like `.` on the left of the match.
     #[test]
     fn flags_authority_when_a_path_ends_with_its_name() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -672,7 +672,7 @@ mod tests {
     /// hung off an account field with `::`, so this pins nothing.
     #[test]
     fn flags_authority_when_a_path_hangs_off_its_name() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -692,7 +692,7 @@ mod tests {
     /// field called `authority`.
     #[test]
     fn seeds_suppression_requires_left_identifier_boundary() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -722,7 +722,7 @@ mod tests {
     /// Differs from the negative below only in that `vault` has `seeds`.
     #[test]
     fn flags_authority_in_identity_constrained_struct() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Ctx<'info> {
@@ -748,7 +748,7 @@ mod tests {
     /// for `authority` even though the struct is a pure CPI wrapper.
     #[test]
     fn accepts_mut_only_struct_even_with_authority_name() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct DexAccounts<'info> {
@@ -775,7 +775,7 @@ mod tests {
     /// for authority-named fields.
     #[test]
     fn accepts_cpi_bundle_struct_with_no_account_attrs() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct ApproveCollectionAuthority<'info> {
@@ -805,7 +805,7 @@ mod tests {
     /// which differs by exactly one thing: `record` is untyped.
     #[test]
     fn flags_bare_init_struct_holding_typed_state() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct CreateRecord<'info> {
@@ -829,7 +829,7 @@ mod tests {
     /// of the `seeds` constraint.
     #[test]
     fn flags_authority_in_untyped_struct_with_identity_constraint() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -849,7 +849,7 @@ mod tests {
     /// constraint — an autogenerated wrapper. VL001 must be silent.
     #[test]
     fn accepts_bare_init_only_untyped_struct() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct CreateRecord<'info> {
@@ -873,7 +873,7 @@ mod tests {
     /// pin the PDA — never mention `owner`.
     #[test]
     fn flags_owner_named_only_in_a_bump_expression() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Release<'info> {
@@ -899,7 +899,7 @@ mod tests {
     /// `has_one` on a sibling is the only identity signal.
     #[test]
     fn flags_authority_in_untyped_struct_pinned_only_by_has_one() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -921,7 +921,7 @@ mod tests {
     /// `constraint = ...` on a sibling is the only identity signal.
     #[test]
     fn flags_authority_in_untyped_struct_with_only_a_custom_constraint() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -941,7 +941,7 @@ mod tests {
     /// `#[account(signer)]` on a sibling is the only identity signal.
     #[test]
     fn flags_authority_in_untyped_struct_with_only_a_signer_constraint() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -961,7 +961,7 @@ mod tests {
     /// `#[account(address = ...)]` on a sibling is the only identity signal.
     #[test]
     fn flags_authority_in_untyped_struct_with_only_an_address_constraint() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -981,7 +981,7 @@ mod tests {
     /// A namespaced constraint (`token::mint = ...`) is the only identity signal.
     #[test]
     fn flags_authority_in_untyped_struct_with_only_a_namespaced_constraint() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -1018,7 +1018,7 @@ mod tests {
     /// exactly one thing: the type of the `vault` field.
     #[test]
     fn flags_authority_when_struct_holds_typed_state_account() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -1042,7 +1042,7 @@ mod tests {
     /// argument bundle. VL001 must be silent.
     #[test]
     fn accepts_mut_only_cpi_bundle_without_typed_state() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -1063,7 +1063,7 @@ mod tests {
     /// as much this program's own state as `Account`.
     #[test]
     fn flags_authority_when_struct_holds_account_loader_state() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -1087,7 +1087,7 @@ mod tests {
     /// The typed `vault` puts the struct in scope; `authority` must fire.
     #[test]
     fn case_a_bare_authority_beside_typed_vault_fires() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct WithdrawA<'info> {
@@ -1107,7 +1107,7 @@ mod tests {
     /// `authority` remains unpinned and must fire (`owner` is pinned).
     #[test]
     fn case_b_has_one_on_sibling_pins_only_that_sibling() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct WithdrawB<'info> {
@@ -1129,7 +1129,7 @@ mod tests {
     /// VL001 must be silent.
     #[test]
     fn case_c_has_one_plus_signer_type_is_silent() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct WithdrawC<'info> {
@@ -1153,7 +1153,7 @@ mod tests {
     /// mint::authority line from the sibling constraint.
     #[test]
     fn flags_authority_not_referenced_in_constraint_values() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Ctx<'info> {
@@ -1179,7 +1179,7 @@ mod tests {
     /// `freeze_authority`.
     #[test]
     fn accepts_authority_pinned_by_namespaced_constraint_value() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct TestInitMintIfNeeded<'info> {
@@ -1208,7 +1208,7 @@ mod tests {
     /// constraint being the thing that names the field.
     #[test]
     fn accepts_authority_pinned_by_legacy_string_constraint() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct CreateMember<'info> {
@@ -1236,7 +1236,7 @@ mod tests {
     /// The vault has `has_one` (identity-establishing) so the struct is not skipped.
     #[test]
     fn flags_signer_not_covered_by_own_seeds() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Stake<'info> {
@@ -1259,7 +1259,7 @@ mod tests {
     /// VL001 flags `member_signer`.
     #[test]
     fn accepts_authority_field_with_own_seeds_constraint() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct ExecuteTransaction<'info> {
@@ -1285,7 +1285,7 @@ mod tests {
 
     #[test]
     fn flags_an_unconstrained_authority_account() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -1309,7 +1309,7 @@ mod tests {
     /// `flags_authority_in_untyped_struct_with_identity_constraint`.
     #[test]
     fn accepts_a_signer_typed_authority() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -1335,7 +1335,7 @@ mod tests {
     /// where the same sibling mentions `cfg.admin` and the rule fires.
     #[test]
     fn accepts_an_account_info_guarded_by_an_is_signer_constraint() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
@@ -1358,7 +1358,7 @@ mod tests {
     /// scope clause instead of the typed-state one.
     #[test]
     fn ignores_account_info_fields_without_an_authority_name() {
-        let findings = findings_for(
+        let findings = linked_findings_for(
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
