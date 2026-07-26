@@ -9,6 +9,8 @@ pub struct AnchorModel {
 
 pub struct AccountsStruct {
     pub name: String,
+    /// Argument names declared in `#[instruction(name: Type, …)]` on the struct.
+    pub instruction_args: Vec<String>,
     pub fields: Vec<AccountField>,
 }
 
@@ -60,6 +62,7 @@ fn collect(items: &[syn::Item], out: &mut Vec<AccountsStruct>) {
             syn::Item::Struct(item) if attr::has_derive(&item.attrs, "Accounts") => {
                 out.push(AccountsStruct {
                     name: item.ident.to_string(),
+                    instruction_args: instruction_arg_names(&item.attrs),
                     fields: item.fields.iter().map(account_field).collect(),
                 });
             }
@@ -82,6 +85,73 @@ fn account_field(field: &syn::Field) -> AccountField {
         ty: account_ty(&field.ty),
         constraints: constraints(&field.attrs),
         span,
+    }
+}
+
+/// Parse `#[instruction(name: Type, name2: Type2, …)]` and return the argument names.
+///
+/// Only the argument *names* (the part before the colon) are captured; types are
+/// discarded.  If the attribute is absent or malformed the result is an empty vec.
+fn instruction_arg_names(attrs: &[syn::Attribute]) -> Vec<String> {
+    for attr in attrs {
+        if !attr.path().is_ident("instruction") {
+            continue;
+        }
+        let syn::Meta::List(list) = &attr.meta else {
+            continue;
+        };
+        // Parse as a punctuated sequence of `FnArg` (or `PatType`).
+        // We use a simpler token-level approach so we don't depend on function
+        // syntax: collect everything before the first `:` in each comma-separated
+        // chunk — that is the argument name.
+        return collect_instruction_arg_names(list.tokens.clone());
+    }
+    Vec::new()
+}
+
+fn collect_instruction_arg_names(tokens: proc_macro2::TokenStream) -> Vec<String> {
+    use proc_macro2::TokenTree;
+    // In proc_macro2, `Group` wraps an entire balanced delimiter pair as a
+    // single token, so top-level commas are always bare `Punct(',')` tokens.
+    // We do not need depth tracking here.
+    let mut names = Vec::new();
+    let mut current: Vec<TokenTree> = Vec::new();
+
+    for tt in tokens {
+        match &tt {
+            TokenTree::Punct(p) if p.as_char() == ',' => {
+                if let Some(name) = arg_name_from_chunk(&current) {
+                    names.push(name);
+                }
+                current.clear();
+            }
+            _ => current.push(tt),
+        }
+    }
+    if let Some(name) = arg_name_from_chunk(&current) {
+        names.push(name);
+    }
+    names
+}
+
+/// Given the token trees for one comma-separated chunk (`name: Type`), return
+/// the name portion (everything before the first `:` that is a `Punct`).
+fn arg_name_from_chunk(chunk: &[proc_macro2::TokenTree]) -> Option<String> {
+    use proc_macro2::TokenTree;
+    let colon_pos = chunk
+        .iter()
+        .position(|tt| matches!(tt, TokenTree::Punct(p) if p.as_char() == ':'));
+    let name_tokens = &chunk[..colon_pos.unwrap_or(chunk.len())];
+    let name: String = name_tokens
+        .iter()
+        .map(|tt| tt.to_string())
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
     }
 }
 
@@ -243,5 +313,35 @@ mod tests {
         );
 
         assert_eq!(model.accounts_structs[0].fields[0].span.start().line, 3);
+    }
+
+    #[test]
+    fn parses_instruction_arg_names() {
+        let model = model(
+            r#"
+            #[derive(Accounts)]
+            #[instruction(user_bump: u8, amount: u64)]
+            pub struct Deposit<'info> {
+                pub vault: Account<'info, Vault>,
+            }
+        "#,
+        );
+
+        let args = &model.accounts_structs[0].instruction_args;
+        assert_eq!(args, &["user_bump", "amount"]);
+    }
+
+    #[test]
+    fn instruction_args_empty_when_no_instruction_attr() {
+        let model = model(
+            r#"
+            #[derive(Accounts)]
+            pub struct Deposit<'info> {
+                pub vault: Account<'info, Vault>,
+            }
+        "#,
+        );
+
+        assert!(model.accounts_structs[0].instruction_args.is_empty());
     }
 }

@@ -58,7 +58,7 @@ fn every_vulnerable_example_is_detected_at_the_expected_line() {
         (
             "VL004".to_string(),
             "examples/vulnerable/pda_bump.rs".to_string(),
-            6,
+            7,
         ),
         (
             "VL005".to_string(),

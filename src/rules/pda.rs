@@ -7,6 +7,15 @@ use crate::rules::{Rule, RuleContext};
 
 pub struct UnvalidatedPdaBump;
 
+/// Returns `true` when `expr` is a bare Rust identifier (no `.`, `::`, `(`,
+/// `[`, whitespace, etc.).  Used to distinguish `user_bump` (attacker-
+/// controlled instruction argument) from `vault.bump` (field access, safe).
+fn is_bare_identifier(expr: &str) -> bool {
+    !expr.is_empty()
+        && expr.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && expr.chars().next().is_some_and(|c| !c.is_ascii_digit())
+}
+
 impl Rule for UnvalidatedPdaBump {
     fn id(&self) -> &'static str {
         "VL004"
@@ -19,21 +28,42 @@ impl Rule for UnvalidatedPdaBump {
                     .constraints
                     .iter()
                     .any(|constraint| matches!(constraint, Constraint::Seeds(_)));
-                let bare_bump = field.constraints.contains(&Constraint::Bump(None));
                 let initialising = field.constraints.contains(&Constraint::Init);
-                if seeded && bare_bump && !initialising {
-                    out.push(ctx.finding(
-                        "VL004",
-                        Severity::Medium,
-                        "PDA bump is not validated",
-                        format!(
-                            "`{}` re-derives its PDA with a bare `bump`. A caller can supply a \
-                             non-canonical bump and address a different account.",
-                            field.name
-                        ),
-                        "Validate against the stored canonical bump, e.g. `bump = <account>.bump`.",
-                        field.span,
-                    ));
+
+                // Find `bump = <expr>` on this field, if any.
+                let bump_expr = field.constraints.iter().find_map(|c| match c {
+                    Constraint::Bump(Some(expr)) => Some(expr.as_str()),
+                    _ => None,
+                });
+
+                // Flag only when: the field has seeds, is not an init, has
+                // `bump = <expr>`, and <expr> is a bare identifier matching one
+                // of the #[instruction(...)] argument names.  A field access
+                // (`vault.bump`), method call, or literal is not attacker-
+                // controlled and must not be flagged.
+                if seeded && !initialising {
+                    if let Some(expr) = bump_expr {
+                        let is_bare_ident = is_bare_identifier(expr);
+                        let is_instruction_arg =
+                            accounts.instruction_args.iter().any(|a| a == expr);
+                        if is_bare_ident && is_instruction_arg {
+                            out.push(ctx.finding(
+                                "VL004",
+                                Severity::Medium,
+                                "PDA bump is not validated",
+                                format!(
+                                    "`{}` uses `bump = {expr}`, where `{expr}` is an \
+                                     `#[instruction]` argument. An attacker controls this value \
+                                     and can pass a non-canonical bump to address a different \
+                                     account.",
+                                    field.name
+                                ),
+                                "Store the canonical bump (from `init`) in the account data and \
+                                 validate with `bump = <account>.bump`.",
+                                field.span,
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -80,8 +110,31 @@ mod tests {
     use super::*;
     use crate::rules::findings_for;
 
+    // ── positive: bump = <instruction arg> is flagged ────────────────────────
+
     #[test]
-    fn flags_a_bare_bump_on_a_reused_pda() {
+    fn flags_bump_equal_to_instruction_argument() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            #[instruction(user_bump: u8)]
+            pub struct Withdraw<'info> {
+                #[account(mut, seeds = [b"vault", user.key().as_ref()], bump = user_bump)]
+                pub vault: Account<'info, Vault>,
+            }
+        "#,
+            &UnvalidatedPdaBump,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "VL004");
+        assert_eq!(findings[0].line, 6);
+    }
+
+    // ── negative: bare bump is safe (find_program_address) ───────────────────
+
+    #[test]
+    fn accepts_bare_bump_on_reused_pda() {
         let findings = findings_for(
             r#"
             #[derive(Accounts)]
@@ -93,13 +146,13 @@ mod tests {
             &UnvalidatedPdaBump,
         );
 
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].rule_id, "VL004");
-        assert_eq!(findings[0].line, 5);
+        assert!(findings.is_empty());
     }
 
+    // ── negative: bump = <field.bump> is the safe stored-bump idiom ──────────
+
     #[test]
-    fn accepts_a_bump_validated_against_stored_state() {
+    fn accepts_bump_validated_against_stored_state() {
         let findings = findings_for(
             r#"
             #[derive(Accounts)]
@@ -114,8 +167,28 @@ mod tests {
         assert!(findings.is_empty());
     }
 
+    // ── negative: bump = <bare ident> not in #[instruction] is not flagged ───
+
     #[test]
-    fn accepts_a_bare_bump_during_initialisation() {
+    fn accepts_bump_equal_to_non_instruction_ident() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct Withdraw<'info> {
+                #[account(mut, seeds = [b"vault"], bump = stored_bump)]
+                pub vault: Account<'info, Vault>,
+            }
+        "#,
+            &UnvalidatedPdaBump,
+        );
+
+        assert!(findings.is_empty());
+    }
+
+    // ── negative: init with bare bump is always safe ──────────────────────────
+
+    #[test]
+    fn accepts_bare_bump_during_initialisation() {
         let findings = findings_for(
             r#"
             #[derive(Accounts)]
@@ -129,6 +202,8 @@ mod tests {
 
         assert!(findings.is_empty());
     }
+
+    // ── retained: raw create_program_address call is still flagged ───────────
 
     #[test]
     fn flags_raw_create_program_address() {

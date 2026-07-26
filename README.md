@@ -40,9 +40,9 @@ $ vaultlint scan ./examples/vulnerable
         Declare the field as `Signer<'info>`, or add `constraint = <account>.is_signer`.
 
 ⚠ MED  PDA bump is not validated
-        ./examples/vulnerable/pda_bump.rs:6
-        `vault` re-derives its PDA with a bare `bump`. A caller can supply a non-canonical bump and address a different account.
-        Validate against the stored canonical bump, e.g. `bump = <account>.bump`.
+        ./examples/vulnerable/pda_bump.rs:7
+        `vault` uses `bump = user_bump`, where `user_bump` is an `#[instruction]` argument. An attacker controls this value and can pass a non-canonical bump to address a different account.
+        Store the canonical bump (from `init`) in the account data and validate with `bump = <account>.bump`.
 
 ⚠ MED  unchecked CPI to unknown program
         ./examples/vulnerable/unchecked_cpi.rs:10
@@ -73,7 +73,7 @@ Exit codes make it CI-ready: `0` when nothing exceeds the threshold, `1` when it
 | [VL001](https://vaultlint.com/rules/VL001) | High | Authority accounts that are not constrained as `Signer` |
 | [VL002](https://vaultlint.com/rules/VL002) | High | Account data deserialised without an owner check |
 | [VL003](https://vaultlint.com/rules/VL003) | Medium | Unchecked `+ - *` written into account state |
-| [VL004](https://vaultlint.com/rules/VL004) | Medium | PDAs re-derived with an unvalidated bump |
+| [VL004](https://vaultlint.com/rules/VL004) | Medium | PDAs validated with a caller-supplied bump (`bump = <instruction arg>`) |
 | [VL005](https://vaultlint.com/rules/VL005) | Medium | `invoke` / `invoke_signed` without program id verification |
 
 Every rule is deliberately narrow. A linter that cries wolf on healthy code gets
