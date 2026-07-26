@@ -179,6 +179,14 @@ pub(crate) fn linked_findings_for(source: &str, rule: &dyn LinkedRule) -> Vec<Fi
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).expect("test temp dir must be creatable");
+    // Pins the crate boundary to this directory instead of letting it fall back
+    // to whatever ancestor of the system temp dir happens to hold a Cargo.toml,
+    // which would merge every invocation into one crate.
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"vaultlint-test\"\n",
+    )
+    .expect("test crate manifest must be writable");
     let path = dir.join("test.rs");
     std::fs::write(&path, source).expect("test source must be writable");
 
@@ -194,5 +202,6 @@ pub(crate) fn linked_findings_for(source: &str, rule: &dyn LinkedRule) -> Vec<Fi
     };
     let mut out = Vec::new();
     rule.check(&ctx, &mut out);
+    let _ = std::fs::remove_dir_all(&dir);
     out
 }

@@ -95,12 +95,15 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
         findings.append(&mut file_findings);
     }
 
-    // Most severe first, then stable by location — one ordering for every renderer.
+    // Most severe first, then by location — one ordering for every renderer.
+    // The rule id is the final tiebreak so that two findings on the same line
+    // keep their order regardless of which phase produced them.
     findings.sort_by(|a, b| {
         b.severity
             .cmp(&a.severity)
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.rule_id.cmp(b.rule_id))
     });
 
     ScanReport {

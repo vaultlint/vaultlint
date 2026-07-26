@@ -11,8 +11,6 @@ use std::path::{Path, PathBuf};
 
 /// Facts collected from one file during phase 1.
 pub struct FileFacts {
-    /// Names of `#[derive(Accounts)]` structs, in AST order.
-    pub structs: Vec<String>,
     /// Every fn and method, in AST order.
     pub functions: Vec<FnFact>,
 }
@@ -26,9 +24,6 @@ pub struct FnFact {
     pub context_param: Option<ContextParam>,
     /// Parameter binding names, in declaration order.
     pub params: Vec<String>,
-    /// Names of callees to which the *whole* ctx binding is passed as a
-    /// top-level argument.
-    pub ctx_forwards: Vec<String>,
 }
 
 pub struct ContextParam {
@@ -88,34 +83,13 @@ where
 
 pub fn collect_facts(file: &syn::File) -> FileFacts {
     let mut functions = Vec::new();
-    walk_fns(&file.items, &mut |self_ty, sig, block| {
-        functions.push(fn_fact(self_ty, sig, block));
+    walk_fns(&file.items, &mut |self_ty, sig, _| {
+        functions.push(fn_fact(self_ty, sig));
     });
-    FileFacts {
-        structs: accounts_struct_names(&file.items),
-        functions,
-    }
+    FileFacts { functions }
 }
 
-fn accounts_struct_names(items: &[syn::Item]) -> Vec<String> {
-    let mut names = Vec::new();
-    for item in items {
-        match item {
-            syn::Item::Mod(module) => {
-                if let Some((_, inner)) = &module.content {
-                    names.extend(accounts_struct_names(inner));
-                }
-            }
-            syn::Item::Struct(item) if crate::anchor::attr::has_derive(&item.attrs, "Accounts") => {
-                names.push(item.ident.to_string());
-            }
-            _ => {}
-        }
-    }
-    names
-}
-
-fn fn_fact(self_ty: Option<&syn::Type>, sig: &syn::Signature, block: &syn::Block) -> FnFact {
+fn fn_fact(self_ty: Option<&syn::Type>, sig: &syn::Signature) -> FnFact {
     let mut params = Vec::new();
     let mut context_param = None;
     for arg in &sig.inputs {
@@ -141,17 +115,11 @@ fn fn_fact(self_ty: Option<&syn::Type>, sig: &syn::Signature, block: &syn::Block
         params.push(binding);
     }
 
-    let ctx_forwards = context_param
-        .as_ref()
-        .map(|ctx| forwarded_callees(block, &ctx.binding))
-        .unwrap_or_default();
-
     FnFact {
         name: sig.ident.to_string(),
         impl_self_ty: self_ty.and_then(final_segment),
         context_param,
         params,
-        ctx_forwards,
     }
 }
 
@@ -190,64 +158,6 @@ fn final_segment(ty: &syn::Type) -> Option<String> {
         .segments
         .last()
         .map(|segment| segment.ident.to_string())
-}
-
-/// Callees that receive the *whole* context binding as a top-level argument.
-///
-/// Deliberately narrow: `#[program]` modules in production programs are often
-/// pure delegation wrappers, so one hop is needed to reach the real handler.
-/// Anything looser — following a field, or a second hop — reaches hundreds of
-/// unrelated bodies in a large program.
-fn forwarded_callees(block: &syn::Block, binding: &str) -> Vec<String> {
-    let mut visitor = ForwardVisitor {
-        binding,
-        out: Vec::new(),
-    };
-    syn::visit::Visit::visit_block(&mut visitor, block);
-    visitor.out
-}
-
-struct ForwardVisitor<'a> {
-    binding: &'a str,
-    out: Vec<String>,
-}
-
-impl ForwardVisitor<'_> {
-    fn record(&mut self, name: String) {
-        if !self.out.contains(&name) {
-            self.out.push(name);
-        }
-    }
-}
-
-impl<'ast> syn::visit::Visit<'ast> for ForwardVisitor<'_> {
-    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-        if node.args.iter().any(|arg| is_binding(arg, self.binding)) {
-            if let syn::Expr::Path(path) = &*node.func {
-                if let Some(segment) = path.path.segments.last() {
-                    self.record(segment.ident.to_string());
-                }
-            }
-        }
-        syn::visit::visit_expr_call(self, node);
-    }
-
-    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-        if node.args.iter().any(|arg| is_binding(arg, self.binding)) {
-            self.record(node.method.to_string());
-        }
-        syn::visit::visit_expr_method_call(self, node);
-    }
-}
-
-/// True for `b`, `&b` and `&mut b`, false for `b.accounts.x`.
-fn is_binding(expr: &syn::Expr, binding: &str) -> bool {
-    match expr {
-        syn::Expr::Reference(inner) => is_binding(&inner.expr, binding),
-        syn::Expr::Paren(inner) => is_binding(&inner.expr, binding),
-        syn::Expr::Path(path) => path.path.is_ident(binding),
-        _ => false,
-    }
 }
 
 struct FileEntry {
@@ -297,7 +207,13 @@ impl UseSiteIndex {
         let mut seen = HashSet::new();
 
         // 1. Functions taking `Context<struct_name>`.
-        let mut direct = Vec::new();
+        //
+        // A `#[program]` fn that forwards its whole `ctx` to a helper needs no
+        // separate delegation hop: the helper only typechecks if it takes the
+        // same `Context<struct_name>`, so this pass already returns it. Do not
+        // add a hop that resolves callees by name — in the canonical Anchor
+        // layout every instruction module exports `pub fn handler`, and a
+        // by-name hop would union unrelated handlers.
         for &file in files {
             for (ordinal, function) in self.files[file].facts.functions.iter().enumerate() {
                 if let Some(ctx) = &function.context_param {
@@ -309,7 +225,6 @@ impl UseSiteIndex {
                             ordinal,
                             FieldAccess::Context(ctx.binding.clone()),
                         );
-                        direct.push((file, ordinal));
                     }
                 }
             }
@@ -320,36 +235,6 @@ impl UseSiteIndex {
             for (ordinal, function) in self.files[file].facts.functions.iter().enumerate() {
                 if function.impl_self_ty.as_deref() == Some(struct_name) {
                     push_hit(&mut hits, &mut seen, file, ordinal, FieldAccess::SelfImpl);
-                }
-            }
-        }
-
-        // 3. Exactly one delegation hop, and only into a callee that itself
-        //    takes a `Context` — a `#[program]` fn is frequently a one-line
-        //    wrapper around the real handler. Do not make this recursive.
-        let mut forwarded: Vec<&str> = Vec::new();
-        for &(file, ordinal) in &direct {
-            for name in &self.files[file].facts.functions[ordinal].ctx_forwards {
-                if !forwarded.contains(&name.as_str()) {
-                    forwarded.push(name);
-                }
-            }
-        }
-        for name in forwarded {
-            for &file in files {
-                for (ordinal, function) in self.files[file].facts.functions.iter().enumerate() {
-                    if function.name != name {
-                        continue;
-                    }
-                    if let Some(ctx) = &function.context_param {
-                        push_hit(
-                            &mut hits,
-                            &mut seen,
-                            file,
-                            ordinal,
-                            FieldAccess::Context(ctx.binding.clone()),
-                        );
-                    }
                 }
             }
         }
@@ -432,6 +317,15 @@ impl UseSiteIndex {
             let entry = &self.files[file];
             if let Some(blocks) = self.bodies(&entry.path, &wanted) {
                 for hit in &hits[start..end] {
+                    // Reachable only if the file changed between the two phases,
+                    // which must not panic — but must not pass unnoticed in a
+                    // test either, since a dropped use site is a false negative.
+                    debug_assert!(
+                        blocks.contains_key(&hit.ordinal),
+                        "fn ordinal {} vanished from {}",
+                        hit.ordinal,
+                        entry.path.display()
+                    );
                     let Some(block) = blocks.get(&hit.ordinal) else {
                         continue;
                     };
@@ -472,14 +366,18 @@ impl UseSiteIndex {
     }
 }
 
+/// De-duplicates by function *and* access mode. A fn that is both a method on
+/// `impl S` and takes a `Context<S>` addresses the same fields two ways; keeping
+/// only the first would hide one of them from a rule, and a dropped use site in
+/// a security linter is a false negative.
 fn push_hit(
     hits: &mut Vec<Hit>,
-    seen: &mut HashSet<(usize, usize)>,
+    seen: &mut HashSet<(usize, usize, std::mem::Discriminant<FieldAccess>)>,
     file: usize,
     ordinal: usize,
     access: FieldAccess,
 ) {
-    if seen.insert((file, ordinal)) {
+    if seen.insert((file, ordinal, std::mem::discriminant(&access))) {
         hits.push(Hit {
             file,
             ordinal,
@@ -533,10 +431,14 @@ mod tests {
 
     #[test]
     fn a_plain_parameter_is_not_a_context_parameter() {
-        let facts = facts("pub fn a(amount: u64) {}");
+        // `Vec<Deposit>` is the case that pins the `Context` guard: it is a
+        // generic path type whose last type argument is an `Accounts` struct, so
+        // without the guard it would be read as `Context<Deposit>`.
+        let facts = facts("pub fn a(amount: u64) {} pub fn b(v: Vec<Deposit>) {}");
 
         assert!(facts.functions[0].context_param.is_none());
         assert_eq!(facts.functions[0].params, ["amount"]);
+        assert!(facts.functions[1].context_param.is_none());
     }
 
     #[test]
@@ -560,34 +462,6 @@ mod tests {
         let facts = facts("pub fn a((x, y): (u8, u8), amount: u64) {}");
 
         assert_eq!(facts.functions[0].params, ["", "amount"]);
-    }
-
-    #[test]
-    fn ctx_forwards_records_the_whole_binding_and_nothing_else() {
-        let facts = facts(
-            r#"
-            pub fn wrapper(ctx: Context<Deposit>, amount: u64) -> Result<()> {
-                check(&ctx.accounts.vault);
-                handle(ctx, amount);
-                other(&mut ctx);
-                ctx.accounts.vault.reload();
-                helper.forward(ctx)
-            }
-        "#,
-        );
-
-        assert_eq!(
-            facts.functions[0].ctx_forwards,
-            ["handle", "other", "forward"]
-        );
-    }
-
-    #[test]
-    fn records_accounts_struct_names_only() {
-        let facts =
-            facts("#[derive(Accounts)] pub struct Deposit {} #[derive(Debug)] pub struct Other {}");
-
-        assert_eq!(facts.structs, ["Deposit"]);
     }
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -661,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn follows_one_delegation_hop_into_the_real_handler() {
+    fn a_program_wrapper_and_the_handler_it_forwards_to_are_both_found() {
         let dir = temp_dir("delegation");
         let root = crate_dir(&dir, "program");
         let decl = root.join("program.rs");
@@ -674,7 +548,7 @@ mod tests {
             ),
             (
                 handler.clone(),
-                "pub fn handle_deposit(c: Context<DepositInner>, amount: u64) -> Result<()> { c.accounts.authority.key(); Ok(()) }",
+                "pub fn handle_deposit(c: Context<Deposit>, amount: u64) -> Result<()> { c.accounts.authority.key(); Ok(()) }",
             ),
         ]);
 
@@ -682,47 +556,54 @@ mod tests {
 
         assert_eq!(sites.len(), 2);
         let delegated = sites.iter().find(|s| s.file == handler).unwrap();
-        // The callee's own binding, not the caller's.
         assert_eq!(delegated.access, FieldAccess::Context("c".to_string()));
         assert_eq!(delegated.params, ["c", "amount"]);
     }
 
     #[test]
-    fn delegation_does_not_recurse_past_one_hop() {
-        let dir = temp_dir("one_hop");
+    fn a_callee_taking_a_different_accounts_struct_is_not_a_use_site() {
+        // The canonical Anchor layout gives every instruction module a
+        // `pub fn handler`, so resolving a forwarded callee by name would union
+        // unrelated handlers into one struct's use sites.
+        let dir = temp_dir("unrelated_callee");
         let root = crate_dir(&dir, "program");
         let decl = root.join("program.rs");
         let index = index_of(&[(
             decl.clone(),
-            "#[derive(Accounts)] pub struct Outer {}\n\
-             pub fn one(ctx: Context<Outer>) -> Result<()> { two(ctx) }\n\
-             pub fn two(ctx: Context<Middle>) -> Result<()> { three(ctx) }\n\
-             pub fn three(ctx: Context<Inner>) -> Result<()> { Ok(()) }",
+            "#[derive(Accounts)] pub struct Deposit {}\n\
+             #[derive(Accounts)] pub struct Withdraw {}\n\
+             pub fn deposit(ctx: Context<Deposit>) -> Result<()> { handler(ctx) }\n\
+             pub fn handler(ctx: Context<Withdraw>) -> Result<()> { Ok(()) }",
         )]);
 
-        let sites = index.use_sites(&decl, "Outer");
+        let sites = index.use_sites(&decl, "Deposit");
 
-        assert_eq!(sites.len(), 2);
-        // `three` is two hops away and must not appear.
-        let bodies: Vec<String> = sites.iter().map(body_of).collect();
-        assert_eq!(bodies, ["{two(ctx)}", "{three(ctx)}"]);
+        assert_eq!(sites.len(), 1);
+        assert_eq!(body_of(&sites[0]), "{handler(ctx)}");
     }
 
     #[test]
-    fn a_callee_without_a_context_parameter_is_not_a_use_site() {
-        let dir = temp_dir("no_ctx_callee");
+    fn a_fn_addressable_two_ways_keeps_both_access_modes() {
+        // A method on `impl Deposit` that also takes a `Context<Deposit>` reads
+        // fields as `self.x` *and* `ctx.accounts.x`; dropping either entry would
+        // hide half of the accesses from a rule.
+        let dir = temp_dir("dual_access");
         let root = crate_dir(&dir, "program");
         let decl = root.join("program.rs");
         let index = index_of(&[(
             decl.clone(),
-            "#[derive(Accounts)] pub struct Outer {}\n\
-             pub fn one(ctx: Context<Outer>) -> Result<()> { log(ctx) }\n\
-             pub fn log(anything: u64) -> Result<()> { Ok(()) }",
+            "#[derive(Accounts)] pub struct Deposit {}\n\
+             impl<'info> Deposit<'info> {\n\
+                 fn run(&self, ctx: Context<Deposit>) -> Result<()> { Ok(()) }\n\
+             }",
         )]);
 
-        let sites = index.use_sites(&decl, "Outer");
+        let sites = index.use_sites(&decl, "Deposit");
 
-        assert_eq!(sites.len(), 1);
+        assert_eq!(sites.len(), 2);
+        let modes: Vec<&FieldAccess> = sites.iter().map(|s| &s.access).collect();
+        assert!(modes.contains(&&FieldAccess::Context("ctx".to_string())));
+        assert!(modes.contains(&&FieldAccess::SelfImpl));
     }
 
     #[test]
