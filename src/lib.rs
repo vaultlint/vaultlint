@@ -131,25 +131,43 @@ mod scan_tests {
     use super::*;
     use std::fs;
 
+    /// A struct declaration and the handler that reads the unproven authority's
+    /// key, split across two files so that phase 2 has to link them.
+    const DECLARATION: &str = "\
+#[derive(Accounts)]
+pub struct Create<'info> {
+    #[account(init, payer = fee_payer, space = 64, seeds = [authority.key().as_ref()], bump)]
+    pub record: Account<'info, Record>,
+    /// CHECK: unvalidated
+    pub authority: AccountInfo<'info>,
+    #[account(mut)]
+    pub fee_payer: Signer<'info>,
+}
+";
+
+    const HANDLER: &str = "\
+pub fn create(ctx: Context<Create>) -> Result<()> {
+    ctx.accounts.record.owner = ctx.accounts.authority.key();
+    Ok(())
+}
+";
+
     #[test]
     fn scans_a_directory_and_skips_unparsable_files() {
         let dir = std::env::temp_dir().join("vaultlint_scan_integration");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join("withdraw.rs"),
-            "#[derive(Accounts)]\npub struct W<'info> {\n    #[account(mut, seeds = [b\"vault\"], bump)]\n    pub vault: Account<'info, Vault>,\n    pub authority: AccountInfo<'info>,\n}\n",
-        )
-        .unwrap();
+        fs::write(dir.join("create.rs"), DECLARATION).unwrap();
+        fs::write(dir.join("handler.rs"), HANDLER).unwrap();
         fs::write(dir.join("broken.rs"), "fn ( { not rust").unwrap();
 
         let report = scan(&ScanOptions { root: dir.clone() });
 
-        assert_eq!(report.files_scanned, 1);
+        assert_eq!(report.files_scanned, 2);
         assert_eq!(report.skipped.len(), 1);
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.findings[0].rule_id, "VL001");
-        assert!(report.findings[0].file.ends_with("withdraw.rs"));
+        assert!(report.findings[0].file.ends_with("create.rs"));
     }
 
     #[test]
@@ -158,13 +176,17 @@ mod scan_tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(
-            dir.join("withdraw.rs"),
-            "#[derive(Accounts)]\npub struct W<'info> {\n    // vaultlint:allow VL001 — checked elsewhere\n    pub authority: AccountInfo<'info>,\n}\n",
+            dir.join("create.rs"),
+            DECLARATION.replace(
+                "    /// CHECK: unvalidated",
+                "    // vaultlint:allow VL001 — designation is permissionless by design\n    /// CHECK: unvalidated",
+            ),
         )
         .unwrap();
+        fs::write(dir.join("handler.rs"), HANDLER).unwrap();
 
         let report = scan(&ScanOptions { root: dir });
 
-        assert!(report.findings.is_empty());
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
     }
 }

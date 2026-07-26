@@ -38,7 +38,7 @@ fn every_vulnerable_example_is_detected_at_the_expected_line() {
         (
             "VL001".to_string(),
             "examples/vulnerable/missing_signer.rs".to_string(),
-            8,
+            27,
         ),
         (
             "VL002".to_string(),

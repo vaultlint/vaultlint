@@ -1,8 +1,8 @@
 pub mod arithmetic;
 pub mod cpi;
+pub mod init_authority;
 pub mod owner;
 pub mod pda;
-pub mod signer;
 
 use std::path::Path;
 
@@ -137,7 +137,7 @@ pub fn all() -> Vec<Box<dyn Rule>> {
 }
 
 pub fn linked_all() -> Vec<Box<dyn LinkedRule>> {
-    vec![Box::new(signer::MissingSignerCheck)]
+    vec![Box::new(init_authority::UnprovenAuthorityOnInit)]
 }
 
 #[cfg(test)]
@@ -166,10 +166,28 @@ pub(crate) fn findings_with_overflow_checks(
 }
 
 /// Runs a `LinkedRule` over one source, against an index containing only that
-/// source. The source is written to a uniquely-named temp file because the
-/// index keys — and crate-scopes — everything by real path.
+/// source.
 #[cfg(test)]
 pub(crate) fn linked_findings_for(source: &str, rule: &dyn LinkedRule) -> Vec<Finding> {
+    linked_findings_for_files(&[("test.rs", source)], rule)
+}
+
+/// Runs a `LinkedRule` over a small multi-file tree, returning the findings for
+/// `files[0]`.
+///
+/// Every file is written into one uniquely-named temp directory, because the
+/// index keys — and crate-scopes — everything by real path. A file whose name
+/// does not end in `.rs` is written but not parsed, which is how a test lays
+/// down a nested `Cargo.toml` to split the tree into two crates.
+///
+/// All files are written *before* any of them is indexed: `crate_id` caches its
+/// answer per directory, so indexing `a/lib.rs` before `a/Cargo.toml` exists
+/// would pin that directory to the outer crate for the rest of the run.
+#[cfg(test)]
+pub(crate) fn linked_findings_for_files(
+    files: &[(&str, &str)],
+    rule: &dyn LinkedRule,
+) -> Vec<Finding> {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -178,6 +196,7 @@ pub(crate) fn linked_findings_for(source: &str, rule: &dyn LinkedRule) -> Vec<Fi
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("test temp dir must be creatable");
     // Pins the crate boundary to this directory instead of letting it fall back
     // to whatever ancestor of the system temp dir happens to hold a Cargo.toml,
@@ -187,15 +206,32 @@ pub(crate) fn linked_findings_for(source: &str, rule: &dyn LinkedRule) -> Vec<Fi
         "[package]\nname = \"vaultlint-test\"\n",
     )
     .expect("test crate manifest must be writable");
-    let path = dir.join("test.rs");
-    std::fs::write(&path, source).expect("test source must be writable");
 
+    let paths: Vec<std::path::PathBuf> = files
+        .iter()
+        .map(|(name, source)| {
+            let path = dir.join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("test subdirectory must be creatable");
+            }
+            std::fs::write(&path, source).expect("test source must be writable");
+            path
+        })
+        .collect();
+
+    let mut index = UseSiteIndex::empty();
+    for (path, (_, source)) in paths.iter().zip(files) {
+        if path.extension().is_some_and(|ext| ext == "rs") {
+            let ast = syn::parse_file(source).expect("test source must parse");
+            index.insert(path, crate::usesite::collect_facts(&ast));
+        }
+    }
+
+    let source = files[0].1;
     let ast = syn::parse_file(source).expect("test source must parse");
     let anchor = crate::anchor::build(&ast);
-    let mut index = UseSiteIndex::empty();
-    index.insert(&path, crate::usesite::collect_facts(&ast));
     let ctx = LinkedContext {
-        path: &path,
+        path: &paths[0],
         source,
         anchor: &anchor,
         index: &index,
