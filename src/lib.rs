@@ -5,6 +5,7 @@ pub mod project;
 pub mod report;
 pub mod rules;
 pub mod scan;
+pub mod suppress;
 
 use std::path::PathBuf;
 
@@ -46,9 +47,12 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
                     anchor: &anchor,
                     overflow_checks: project.overflow_checks,
                 };
+                let mut file_findings = Vec::new();
                 for rule in &rules {
-                    rule.check(&ctx, &mut findings);
+                    rule.check(&ctx, &mut file_findings);
                 }
+                file_findings.retain(|finding| !suppress::is_suppressed(&file.source, finding));
+                findings.append(&mut file_findings);
             }
             Err(error) => skipped.push(SkippedFile {
                 path,
@@ -109,5 +113,21 @@ mod scan_tests {
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.findings[0].rule_id, "VL001");
         assert!(report.findings[0].file.ends_with("withdraw.rs"));
+    }
+
+    #[test]
+    fn scan_drops_suppressed_findings() {
+        let dir = std::env::temp_dir().join("vaultlint_suppress_integration");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("withdraw.rs"),
+            "#[derive(Accounts)]\npub struct W<'info> {\n    // vaultlint:allow VL001 — checked elsewhere\n    pub authority: AccountInfo<'info>,\n}\n",
+        )
+        .unwrap();
+
+        let report = scan(&ScanOptions { root: dir });
+
+        assert!(report.findings.is_empty());
     }
 }
