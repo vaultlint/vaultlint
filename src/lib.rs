@@ -101,7 +101,7 @@ mod scan_tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("withdraw.rs"),
-            "#[derive(Accounts)]\npub struct W<'info> {\n    pub authority: AccountInfo<'info>,\n}\n",
+            "#[derive(Accounts)]\npub struct W<'info> {\n    #[account(mut)]\n    pub vault: Account<'info, Vault>,\n    pub authority: AccountInfo<'info>,\n}\n",
         )
         .unwrap();
         fs::write(dir.join("broken.rs"), "fn ( { not rust").unwrap();

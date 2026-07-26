@@ -63,25 +63,31 @@ impl Rule for MissingSignerCheck {
 
     fn check(&self, ctx: &RuleContext<'_>, out: &mut Vec<Finding>) {
         for accounts in &ctx.anchor.accounts_structs {
-            // Pre-compute: collect all seeds texts in this struct.
-            let all_seeds: Vec<&str> = accounts
-                .fields
-                .iter()
-                .flat_map(|f| {
-                    f.constraints.iter().filter_map(|c| match c {
-                        Constraint::Seeds(s) => Some(s.as_str()),
-                        _ => None,
-                    })
-                })
-                .collect();
+            // Class 1: CPI account bundles have no `#[account(...)]` attribute on
+            // any field.  In those structs validation is the callee's job; flagging
+            // the authority-named fields is meaningless noise.
+            let has_any_account_attr = accounts.fields.iter().any(|f| !f.constraints.is_empty());
+            if !has_any_account_attr {
+                continue;
+            }
 
-            // Pre-compute: collect all has_one targets in this struct.
-            let has_one_targets: Vec<&str> = accounts
+            // Pre-compute: collect all constraint *values* from every field in
+            // this struct.  This covers seeds texts, has_one targets, namespaced
+            // constraints such as `mint::authority = mint_authority`, plain
+            // `payer = authority`, and custom `constraint = ...` expressions.
+            // A field is considered "pinned" if its name appears as a whole
+            // identifier in any of these value strings — the same boundary check
+            // used for seeds prevents `authority` from matching `authority_bump`.
+            let all_constraint_values: Vec<&str> = accounts
                 .fields
                 .iter()
                 .flat_map(|f| {
                     f.constraints.iter().filter_map(|c| match c {
-                        Constraint::HasOne(target) => Some(target.as_str()),
+                        Constraint::Seeds(v) | Constraint::HasOne(v) | Constraint::Custom(v) => {
+                            Some(v.as_str())
+                        }
+                        Constraint::Other(_, v) if !v.is_empty() => Some(v.as_str()),
+                        Constraint::Bump(Some(v)) => Some(v.as_str()),
                         _ => None,
                     })
                 })
@@ -101,22 +107,22 @@ impl Rule for MissingSignerCheck {
                     continue;
                 }
 
-                // Check all forms of validation — skip if any is present.
+                // Check all forms of per-field validation — skip if any is present.
 
-                // 1. `#[account(signer)]` → Other("signer")
+                // 1. `#[account(signer)]` → Other("signer", "")
                 if field
                     .constraints
                     .iter()
-                    .any(|c| matches!(c, Constraint::Other(k) if k == "signer"))
+                    .any(|c| matches!(c, Constraint::Other(k, _) if k == "signer"))
                 {
                     continue;
                 }
 
-                // 2. `#[account(address = ...)]` → Other("address")
+                // 2. `#[account(address = ...)]` → Other("address", value)
                 if field
                     .constraints
                     .iter()
-                    .any(|c| matches!(c, Constraint::Other(k) if k == "address"))
+                    .any(|c| matches!(c, Constraint::Other(k, _) if k == "address"))
                 {
                     continue;
                 }
@@ -130,13 +136,25 @@ impl Rule for MissingSignerCheck {
                     continue;
                 }
 
-                // 4. Field name appears as an identifier inside any sibling Seeds text.
-                if all_seeds.iter().any(|s| name_in_seeds(&field.name, s)) {
+                // 3b. Field itself has `#[account(seeds = ..., bump)]` → it IS a
+                //     PDA and Anchor validates the derivation.  A field name like
+                //     `member_signer` that carries its own seeds constraint is not
+                //     unvalidated — the runtime confirms the address at call time.
+                if field
+                    .constraints
+                    .iter()
+                    .any(|c| matches!(c, Constraint::Seeds(_)))
+                {
                     continue;
                 }
 
-                // 5. Field is the target of a has_one on a sibling.
-                if has_one_targets.contains(&field.name.as_str()) {
+                // 4. Field name appears as a whole identifier in the value text of
+                //    ANY constraint on ANY sibling field (seeds, has_one, payer =,
+                //    mint::authority =, token::authority =, etc.).
+                if all_constraint_values
+                    .iter()
+                    .any(|v| name_in_seeds(&field.name, v))
+                {
                     continue;
                 }
 
@@ -171,6 +189,7 @@ mod tests {
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
+                #[account(mut)]
                 pub vault: Account<'info, Vault>,
                 pub authority: AccountInfo<'info>,
             }
@@ -191,6 +210,8 @@ mod tests {
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
+                #[account(mut)]
+                pub vault: Account<'info, Vault>,
                 pub pool_authority: AccountInfo<'info>,
             }
         "#,
@@ -210,6 +231,8 @@ mod tests {
             r#"
             #[derive(Accounts)]
             pub struct Transfer<'info> {
+                #[account(mut)]
+                pub vault: Account<'info, Vault>,
                 pub vault_authority: AccountInfo<'info>,
             }
         "#,
@@ -386,6 +409,161 @@ mod tests {
         assert!(findings[0].message.contains("authority"));
     }
 
+    // ── class 1: CPI bundle (no #[account(...)] on any field) ─────────────
+
+    /// Positive: struct with at least one constrained field fires for an
+    /// unconstrained authority-named field.
+    #[test]
+    fn flags_authority_when_some_fields_have_constraints() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct Ctx<'info> {
+                #[account(mut)]
+                pub vault: AccountInfo<'info>,
+                pub authority: AccountInfo<'info>,
+            }
+        "#,
+            &MissingSignerCheck,
+        );
+        // vault has a constraint, so the struct is NOT a pure CPI bundle.
+        // authority is unconstrained → should fire.
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("authority"));
+    }
+
+    /// Negative: CPI-bundle struct — no field carries ANY #[account(...)]
+    /// attribute. VL001 must be silent (the callee program validates).
+    ///
+    /// Guard removed: class-1 CPI-bundle skip. When removed the test fails
+    /// because VL001 flags `authority`.
+    #[test]
+    fn accepts_cpi_bundle_struct_with_no_account_attrs() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct ApproveCollectionAuthority<'info> {
+                pub collection_authority_record: AccountInfo<'info>,
+                pub new_collection_authority: AccountInfo<'info>,
+                pub update_authority: AccountInfo<'info>,
+                pub payer: AccountInfo<'info>,
+                pub metadata: AccountInfo<'info>,
+                pub mint: AccountInfo<'info>,
+            }
+        "#,
+            &MissingSignerCheck,
+        );
+        assert!(
+            findings.is_empty(),
+            "expected no findings, got {findings:?}"
+        );
+    }
+
+    // ── class 2: namespaced constraint values pin the field ───────────────
+
+    /// Positive: `authority` is NOT pinned by any constraint value →
+    /// VL001 fires. Differs from the negative below only by removing the
+    /// mint::authority line from the sibling constraint.
+    #[test]
+    fn flags_authority_not_referenced_in_constraint_values() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct Ctx<'info> {
+                #[account(init, mint::decimals = 6, payer = payer)]
+                pub mint: Account<'info, Mint>,
+                #[account(mut)]
+                pub payer: Signer<'info>,
+                pub authority: AccountInfo<'info>,
+            }
+        "#,
+            &MissingSignerCheck,
+        );
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("authority"));
+    }
+
+    /// Negative: `mint::authority = mint_authority` on a sibling field pins
+    /// `mint_authority` — Anchor verifies the mint's authority equals that
+    /// account at the program level. VL001 must be silent.
+    ///
+    /// Guard removed: name-in-any-constraint-value check. When removed the
+    /// test fails because VL001 flags both `mint_authority` and
+    /// `freeze_authority`.
+    #[test]
+    fn accepts_authority_pinned_by_namespaced_constraint_value() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct TestInitMintIfNeeded<'info> {
+                #[account(init_if_needed, mint::decimals = 6,
+                          mint::authority = mint_authority,
+                          mint::freeze_authority = freeze_authority,
+                          payer = payer)]
+                pub mint: Account<'info, Mint>,
+                #[account(mut)]
+                pub payer: Signer<'info>,
+                pub mint_authority: AccountInfo<'info>,
+                pub freeze_authority: AccountInfo<'info>,
+            }
+        "#,
+            &MissingSignerCheck,
+        );
+        assert!(
+            findings.is_empty(),
+            "expected no findings, got {findings:?}"
+        );
+    }
+
+    // ── class 3: field with own seeds constraint is a PDA (validated) ────────
+
+    /// Positive: `member_signer` has seeds on a *sibling* that don't contain
+    /// its name → it IS unconstrained → must fire.
+    #[test]
+    fn flags_signer_not_covered_by_own_seeds() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct Stake<'info> {
+                #[account(mut)]
+                pub vault: Account<'info, Vault>,
+                pub member_signer: AccountInfo<'info>,
+            }
+        "#,
+            &MissingSignerCheck,
+        );
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("member_signer"));
+    }
+
+    /// Negative: `member_signer` itself carries `#[account(seeds = [...], bump)]`
+    /// — Anchor verifies it equals the PDA, so it IS validated. VL001 silent.
+    ///
+    /// Guard removed: own-seeds check. When removed the test fails because
+    /// VL001 flags `member_signer`.
+    #[test]
+    fn accepts_authority_field_with_own_seeds_constraint() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct ExecuteTransaction<'info> {
+                pub registrar: Account<'info, Registrar>,
+                #[account(
+                    seeds = [registrar.to_account_info().key.as_ref(), member.to_account_info().key.as_ref()],
+                    bump = member.nonce,
+                )]
+                pub member_signer: AccountInfo<'info>,
+                pub member: Account<'info, Member>,
+            }
+        "#,
+            &MissingSignerCheck,
+        );
+        assert!(
+            findings.is_empty(),
+            "expected no findings, got {findings:?}"
+        );
+    }
+
     // ── legacy: original test preserved ──────────────────────────────────────
 
     #[test]
@@ -394,6 +572,7 @@ mod tests {
             r#"
             #[derive(Accounts)]
             pub struct Withdraw<'info> {
+                #[account(mut)]
                 pub vault: Account<'info, Vault>,
                 pub authority: AccountInfo<'info>,
             }
@@ -403,7 +582,7 @@ mod tests {
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, "VL001");
-        assert_eq!(findings[0].line, 5);
+        assert_eq!(findings[0].line, 6);
         assert!(findings[0].message.contains("authority"));
     }
 

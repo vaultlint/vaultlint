@@ -42,7 +42,9 @@ pub enum Constraint {
     Bump(Option<String>),
     HasOne(String),
     Custom(String),
-    Other(String),
+    /// An unrecognised key, e.g. `signer`, `address`, `mint::authority`.
+    /// Carries (key, value) where value is empty for bare keys.
+    Other(String, String),
 }
 
 pub fn build(file: &syn::File) -> AnchorModel {
@@ -177,7 +179,7 @@ fn to_constraint(item: attr::MetaItem) -> Constraint {
         "bump" => Constraint::Bump(if value.is_empty() { None } else { Some(value) }),
         "has_one" => Constraint::HasOne(value),
         "constraint" => Constraint::Custom(value),
-        other => Constraint::Other(other.to_string()),
+        other => Constraint::Other(other.to_string(), value),
     }
 }
 
