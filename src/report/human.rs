@@ -11,9 +11,14 @@ pub fn render(report: &ScanReport, out: &mut dyn Write, colour: bool) -> std::io
         .as_ref()
         .map(|version| format!(" (Anchor {version})"))
         .unwrap_or_default();
+    let test_skip = if report.test_files_skipped > 0 {
+        format!(" ({} test files skipped)", report.test_files_skipped)
+    } else {
+        String::new()
+    };
     writeln!(
         out,
-        "→ analyzing {} Rust files{anchor} …",
+        "→ analyzing {} Rust files{anchor}{test_skip} …",
         report.files_scanned
     )?;
 

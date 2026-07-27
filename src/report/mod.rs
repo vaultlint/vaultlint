@@ -82,6 +82,7 @@ mod tests {
     fn report(findings: Vec<Finding>) -> ScanReport {
         ScanReport {
             files_scanned: 14,
+            test_files_skipped: 0,
             anchor_version: Some("0.30.1".to_string()),
             findings,
             skipped: Vec::<SkippedFile>::new(),

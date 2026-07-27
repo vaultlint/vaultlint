@@ -5,6 +5,7 @@ pub mod project;
 pub mod report;
 pub mod rules;
 pub mod scan;
+pub mod scope;
 pub mod suppress;
 pub mod usesite;
 
@@ -25,6 +26,7 @@ pub struct SkippedFile {
 
 pub struct ScanReport {
     pub files_scanned: usize,
+    pub test_files_skipped: usize,
     pub anchor_version: Option<String>,
     pub findings: Vec<Finding>,
     pub skipped: Vec<SkippedFile>,
@@ -37,15 +39,29 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
     let mut findings = Vec::new();
     let mut skipped = Vec::new();
     let mut files_scanned = 0;
+    let mut test_files_skipped = 0;
     let mut index = UseSiteIndex::empty();
     let mut linked_files = Vec::new();
 
+    // Collect all candidate files first so M3 can be resolved across the tree.
+    let all_files = scan::rust_files(&options.root);
+    let m3_set = scope::collect_m3_set(&all_files);
+
     // Phase 1: run the file-local rules and record the facts the linked rules
     // will need. The AST is dropped as each file finishes.
-    for path in scan::rust_files(&options.root) {
+    for path in all_files {
+        // M1–M3: skip the file entirely before parsing.
+        if scope::is_test_scope(&path, &m3_set) {
+            test_files_skipped += 1;
+            continue;
+        }
+
         match parse::parse(&path) {
             Ok(file) => {
                 files_scanned += 1;
+                // M4: compute inline #[cfg(test)] mod ranges for this file.
+                let test_ranges = scope::test_ranges(&file.ast);
+
                 let anchor = anchor::build(&file.ast);
                 let ctx = RuleContext {
                     path: &file.path,
@@ -58,7 +74,10 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
                 for rule in &rules {
                     rule.check(&ctx, &mut file_findings);
                 }
-                file_findings.retain(|finding| !suppress::is_suppressed(&file.source, finding));
+                file_findings.retain(|finding| {
+                    !suppress::is_suppressed(&file.source, finding)
+                        && !scope::in_test_range(finding.line, &test_ranges)
+                });
                 findings.append(&mut file_findings);
 
                 if !anchor.accounts_structs.is_empty() {
@@ -80,6 +99,7 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
         let Ok(file) = parse::parse(path) else {
             continue;
         };
+        let test_ranges = scope::test_ranges(&file.ast);
         let anchor = anchor::build(&file.ast);
         let ctx = LinkedContext {
             path: &file.path,
@@ -91,7 +111,10 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
         for rule in &linked_rules {
             rule.check(&ctx, &mut file_findings);
         }
-        file_findings.retain(|finding| !suppress::is_suppressed(&file.source, finding));
+        file_findings.retain(|finding| {
+            !suppress::is_suppressed(&file.source, finding)
+                && !scope::in_test_range(finding.line, &test_ranges)
+        });
         findings.append(&mut file_findings);
     }
 
@@ -108,6 +131,7 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
 
     ScanReport {
         files_scanned,
+        test_files_skipped,
         anchor_version: project.anchor_version,
         findings,
         skipped,
