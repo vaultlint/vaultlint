@@ -71,7 +71,7 @@ Exit codes make it CI-ready: `0` when nothing exceeds the threshold, `1` when it
 | ID | Severity | What it catches |
 |----|----------|-----------------|
 | [VL001](https://vaultlint.com/rules/VL001) | Medium | An unvalidated authority baked into the seeds of an account this instruction creates, and written into it |
-| [VL002](https://vaultlint.com/rules/VL002) | High | Account data deserialised without an owner check |
+| [VL002](https://vaultlint.com/rules/VL002) | High | Raw account data deserialised with nothing proving which program owns the account |
 | [VL003](https://vaultlint.com/rules/VL003) | Medium | Unchecked `+ - *` written into account state |
 | [VL004](https://vaultlint.com/rules/VL004) | Medium | PDAs validated with a caller-supplied bump (`bump = <instruction arg>`) |
 | [VL005](https://vaultlint.com/rules/VL005) | Medium | A CPI whose program id comes from an account the caller controls |
@@ -99,6 +99,27 @@ that verifies `is_signer` further away will be flagged; a field forwarded throug
 `remaining_accounts` is invisible; permissionless-by-design is indistinguishable from
 a bug without protocol context, so confirm intent rather than assuming a
 vulnerability; and it only considers fields named like authorities.
+
+**VL002 accepts an address check as an owner check.** Only the deriving program can
+sign for its own PDA, so an account holding data at an address derived from seeds and
+this program's id was created by this program and is owned by it — the guarantee VL002
+asks for, reached another way. A handler that derives the address and compares it to
+the account key is silent, and so is an Anchor field carrying `seeds = [...]` or
+`address = ...`, which Anchor verifies before the body runs. The proof has to name the
+account being read: deriving a PDA for one account does not excuse a raw read of
+another. Order is not required — a check after the read still stops the program acting
+on bad data — so a handler that deserialises first and compares later is silent too.
+
+Reading `.owner` is not checking it. `.owner` names two unrelated things in Solana:
+the program that owns the account, and the wallet field of a deserialised SPL token
+account. VL002 needs `.owner` in a checking position — a comparison, a `require_*!`
+macro, or a helper like `assert_owned_by`. It also does not flag the method form
+`account.try_deserialize(...)`, which is the *safe* Anchor path.
+
+What it still misses: helpers taking a bare `&AccountInfo` whose callers validate are
+reported, because a rule that reads one function at a time cannot see the caller — this
+is the shape Metaplex has historically been exploited through, so the findings stay.
+Test modules and fuzz harnesses are scanned like any other code.
 
 **VL005 does not flag every unverified `invoke`.** It flags a CPI whose `Instruction`
 was built in that same function body and whose `program_id` came from an account —
