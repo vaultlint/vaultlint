@@ -21,7 +21,7 @@ use syn::visit::Visit;
 
 use crate::anchor::{AccountField, AccountTy, AccountsStruct, Constraint};
 use crate::finding::{Finding, Severity};
-use crate::rules::{normalised, LinkedContext, LinkedRule};
+use crate::rules::{find_bounded, is_ident_char, normalised, LinkedContext, LinkedRule};
 use crate::usesite::FieldAccess;
 
 /// Field names that imply the account authorises the instruction.
@@ -47,50 +47,6 @@ fn matches_marker(name: &str, marker: &str) -> bool {
 
 fn is_authority_named(name: &str) -> bool {
     MARKERS.iter().any(|marker| matches_marker(name, marker))
-}
-
-fn is_ident_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
-}
-
-/// Scans `text` for occurrences of `needle`, returning true at the first one
-/// whose neighbours are accepted by both predicates. `left` receives everything
-/// before the match and `right` everything after it, so a predicate that needs
-/// more than one character of context can ask for it.
-///
-/// Shared by the two scanners below because the *walk* is the delicate part —
-/// their boundary rules differ, and deliberately so. Two points of care:
-///
-/// * A failed match resumes at `at + needle.len()`, never `at + 1`. Rust
-///   identifiers may hold any XID character, so `pub émetteur_authority:
-///   UncheckedAccount<'info>` is legal input, and resuming one byte into a
-///   multi-byte character panics on the next slice — unacceptable in a linter,
-///   which must survive every file it is pointed at. Skipping the whole needle
-///   loses nothing: a later match starting *inside* this one has a character of
-///   the needle to its left, and every needle used here begins with an
-///   identifier character, so such a match would fail `left` anyway.
-/// * Both predicates look at characters, never bytes. `text.as_bytes()[i] as
-///   char` would read the second byte of `é` as `©` and answer that an
-///   identifier does not continue there.
-fn find_bounded(
-    text: &str,
-    needle: &str,
-    left: impl Fn(&str) -> bool,
-    right: impl Fn(&str) -> bool,
-) -> bool {
-    let mut start = 0;
-    while let Some(offset) = text[start..].find(needle) {
-        let at = start + offset;
-        let end = at + needle.len();
-        if left(&text[..at]) && right(&text[end..]) {
-            return true;
-        }
-        start = end;
-        if start >= text.len() {
-            break;
-        }
-    }
-    false
 }
 
 /// True if no identifier continues into the match from the left, and the match
