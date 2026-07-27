@@ -196,7 +196,7 @@ fn to_constraint(item: attr::MetaItem) -> Constraint {
     }
 }
 
-fn account_ty(ty: &syn::Type) -> AccountTy {
+pub(crate) fn account_ty(ty: &syn::Type) -> AccountTy {
     let syn::Type::Path(path) = ty else {
         return AccountTy::Other(String::new());
     };

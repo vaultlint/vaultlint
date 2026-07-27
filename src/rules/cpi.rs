@@ -48,7 +48,7 @@
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
-use crate::anchor::AccountTy;
+use crate::anchor::{account_ty, AccountTy};
 use crate::finding::{Finding, Severity};
 use crate::rules::{find_bounded, is_ident_char, normalised, Rule, RuleContext};
 use crate::usesite::context_struct_name;
@@ -146,8 +146,13 @@ impl FunctionVisitor<'_, '_> {
         finder.visit_block(block);
 
         for (call_span, first_arg) in finder.spans_and_first_args {
+            // Every binding lookup for this call is resolved as of the call's own
+            // position, so a `let` that comes later — or one in a sibling branch —
+            // cannot be attributed to it.
+            let at = pos_of(call_span);
+
             // Resolve the first argument through one level of `let` if needed.
-            let instr_expr = resolve_one_hop(&first_arg, &bindings);
+            let instr_expr = resolve_one_hop(&first_arg, &bindings, at);
 
             // T1 — the instruction must have been built in this body.
             let Some(program_id_expr) = instruction_program_id(instr_expr) else {
@@ -161,7 +166,7 @@ impl FunctionVisitor<'_, '_> {
             // that `let target = *ctx.accounts.t.key; Instruction { program_id: target, … }`
             // and the shorthand form `let program_id = …; Instruction { program_id, … }`
             // are both caught. T2 must widen before S2 narrows.
-            let program_id_resolved = resolve_program_id_text(&program_id_text, &bindings);
+            let program_id_resolved = resolve_program_id_text(&program_id_text, &bindings, at);
             if !program_id_resolved.contains(".key") {
                 continue;
             }
@@ -201,19 +206,36 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_, '_> {
 
 // ─── let-binding collection ──────────────────────────────────────────────────
 
+/// A source position as a `(line, column)` pair, ordered lexicographically —
+/// which is exactly "earlier in the file". `proc-macro2`'s `span-locations`
+/// feature is enabled in `Cargo.toml`, so `Span::start()` returns real source
+/// coordinates rather than a placeholder.
+type Pos = (usize, usize);
+
+fn pos_of(span: proc_macro2::Span) -> Pos {
+    let start = span.start();
+    (start.line, start.column)
+}
+
 /// A single `let <name> = <init>;` binding from a block.
 struct LetBinding {
     name: String,
     /// The initialiser expression.
     init: syn::Expr,
+    /// Where the `let` statement starts. Every lookup is resolved against the
+    /// position of the `invoke` that needs it, so a binding cannot influence a
+    /// call that precedes it.
+    pos: Pos,
 }
 
 /// Collects all `let <ident> = <expr>` bindings, walking nested blocks so that
 /// a CPI inside an `if` or `match` arm is not missed.
 ///
-/// Shadowing: later bindings for the same name override earlier ones, because
-/// `let x = <safe>; … let x = Instruction { program_id: *evil.key, … }` must
-/// resolve to the second binding.
+/// **Every** binding is recorded, including repeats of the same name. Neither
+/// first-wins nor last-wins is correct: both describe one fixed state of the
+/// world and apply it to every call in the body. Selection is deferred to
+/// [`nearest_preceding`], which picks the binding a reader would pick — the
+/// last one textually before the call site.
 fn collect_let_bindings(block: &syn::Block) -> Vec<LetBinding> {
     let mut out = Vec::new();
     collect_let_bindings_stmts(&block.stmts, &mut out);
@@ -224,27 +246,30 @@ fn collect_let_bindings_stmts(stmts: &[syn::Stmt], out: &mut Vec<LetBinding>) {
     for stmt in stmts {
         match stmt {
             syn::Stmt::Local(local) => {
-                // Unwrap `Pat::Type` (e.g. `let ix: Instruction = …`) to get the
-                // inner ident pattern.
-                let pat = unwrap_pat_type(&local.pat);
-                let syn::Pat::Ident(pat_ident) = pat else {
-                    continue;
-                };
-                let Some(init) = &local.init else {
-                    continue;
-                };
-                // Unwrap a trailing `?` — `let x = foo()?;` binds `foo()` not `foo()?`.
-                // Also strip a leading `&` on the initialiser: `let ix = &Instruction { … };`
-                let expr = strip_ref(unwrap_try(&init.expr));
-                let name = pat_ident.ident.to_string();
-                // Prefer the latest binding for the same name (shadowing).
-                if let Some(existing) = out.iter_mut().find(|b| b.name == name) {
-                    existing.init = expr.clone();
-                } else {
-                    out.push(LetBinding {
-                        name,
-                        init: expr.clone(),
-                    });
+                if let Some(init) = &local.init {
+                    // Unwrap `Pat::Type` (e.g. `let ix: Instruction = …`) to get
+                    // the inner ident pattern.
+                    if let syn::Pat::Ident(pat_ident) = unwrap_pat_type(&local.pat) {
+                        // Unwrap a trailing `?` — `let x = foo()?;` binds `foo()`
+                        // not `foo()?`. Also strip a leading `&` on the
+                        // initialiser: `let ix = &Instruction { … };`
+                        let expr = strip_ref(unwrap_try(&init.expr));
+                        out.push(LetBinding {
+                            name: pat_ident.ident.to_string(),
+                            init: expr.clone(),
+                            pos: pos_of(local.span()),
+                        });
+                    }
+                    // Descend into the initialiser itself. Without this the
+                    // `Expr::Closure` arm below is unreachable for the common
+                    // `let send = |…| { … };` shape, and `CpiFinder` (which uses
+                    // `visit_block`, and so does enter closures) would find an
+                    // `invoke` whose `let` bindings this walk never saw.
+                    collect_let_bindings_expr(&init.expr, out);
+                    // A let-else's `else { … }` block is a block like any other.
+                    if let Some((_, diverge)) = &init.diverge {
+                        collect_let_bindings_expr(diverge, out);
+                    }
                 }
             }
             // Walk nested blocks in expressions (if, match, block, loop, etc.)
@@ -274,8 +299,31 @@ fn collect_let_bindings_expr(expr: &syn::Expr, out: &mut Vec<LetBinding>) {
         syn::Expr::While(w) => collect_let_bindings_stmts(&w.body.stmts, out),
         syn::Expr::ForLoop(f) => collect_let_bindings_stmts(&f.body.stmts, out),
         syn::Expr::Unsafe(u) => collect_let_bindings_stmts(&u.block.stmts, out),
+        // `CpiFinder` descends into closures, async blocks and try blocks, so
+        // the binding walk must too — otherwise the two walks disagree and a
+        // CPI inside one of them resolves against the wrong table, or none.
+        syn::Expr::Closure(c) => collect_let_bindings_expr(&c.body, out),
+        syn::Expr::Async(a) => collect_let_bindings_stmts(&a.block.stmts, out),
+        syn::Expr::TryBlock(t) => collect_let_bindings_stmts(&t.block.stmts, out),
         _ => {}
     }
+}
+
+/// The binding for `name` that a reader at position `at` would resolve to: the
+/// one with the greatest position **strictly less than** `at`.
+///
+/// "Strictly less" is what makes sibling `if`/`else` arms behave: a binding in
+/// the arm that does not contain `at` is either after `at` (excluded) or before
+/// it but further away than the binding in `at`'s own arm (outranked).
+fn nearest_preceding<'a>(
+    bindings: &'a [LetBinding],
+    name: &str,
+    at: Pos,
+) -> Option<&'a LetBinding> {
+    bindings
+        .iter()
+        .filter(|b| b.name == name && b.pos < at)
+        .max_by_key(|b| b.pos)
 }
 
 /// Unwrap `Pat::Type` to get the inner pattern. `let ix: Instruction = …`
@@ -308,16 +356,19 @@ fn strip_ref(expr: &syn::Expr) -> &syn::Expr {
     }
 }
 
-/// If `expr` is a path naming a local let-binding, return that binding's
-/// initialiser (one hop only). Also strips a leading `&` and a trailing `?`
-/// on the argument, so `&spl_token::instruction::transfer(…)?` resolves to
-/// the inner call.
-fn resolve_one_hop<'a>(expr: &'a syn::Expr, bindings: &'a [LetBinding]) -> &'a syn::Expr {
+/// If `expr` is a path naming a local let-binding **that precedes `at`**,
+/// return that binding's initialiser (one hop only). Also strips a leading `&`
+/// and a trailing `?` on the argument, so `&spl_token::instruction::transfer(…)?`
+/// resolves to the inner call.
+///
+/// `at` is the position of the `invoke` call being examined. If no binding of
+/// that name precedes it there is no hop, and the expression is returned as it
+/// stands.
+fn resolve_one_hop<'a>(expr: &'a syn::Expr, bindings: &'a [LetBinding], at: Pos) -> &'a syn::Expr {
     let inner = unwrap_try(strip_ref(expr));
     if let syn::Expr::Path(path) = inner {
         if let Some(ident) = path.path.get_ident() {
-            let name = ident.to_string();
-            if let Some(binding) = bindings.iter().find(|b| b.name == name) {
+            if let Some(binding) = nearest_preceding(bindings, &ident.to_string(), at) {
                 return &binding.init;
             }
         }
@@ -420,33 +471,56 @@ fn strip_type_refs(ty: &syn::Type) -> &syn::Type {
 
 // ─── S2: is the program id supplied by a Program-typed account? ──────────────
 
-/// Returns the names of all accounts whose program id is already verified,
-/// gathered from three sources:
+/// Returns the access paths of all accounts whose program id is already
+/// verified, gathered from three sources:
 ///
-/// - **S2** (original) — the function's `Context<S>` parameter: look up `S`
-///   in `ctx.anchor.accounts_structs` and collect its `Program`-typed fields.
-///   Names are recorded as bare field names (e.g. `token_program`); the
-///   receiver portion of the program id text is searched for those identifiers
-///   as whole words. `resolve_program_id_text` expands let-aliases first, so
-///   `token_program.key()` where `let token_program = ctx.accounts.token_program
-///   .to_account_info()` expands to the full access path, and `token_program` is
-///   found as a whole identifier in the receiver.
+/// - **S2** (original) — the function's `Context<S>` parameter bound as
+///   `<binding>`: look up `S` in `ctx.anchor.accounts_structs` and record each
+///   `Program`-typed field as `<binding>.accounts.<field>`.
 ///
-/// - **S2b** (new) — the function's own typed parameters: a parameter whose
-///   declared type's final path segment is `Program` (after stripping `&` /
-///   `&mut` and lifetimes) carries an Anchor-verified id. The parameter's binding
-///   name is added directly: it will appear as a whole identifier in the receiver
-///   portion of any program id expression derived from it (e.g. binding name
-///   `token_program` in `token_program.key()`).
+/// - **S2b** — a parameter *typed* `Program<'info, T>` (or `Box<Program<…>>`)
+///   carries an Anchor-verified id itself. Here, and only here, the **bare**
+///   binding name is recorded: the binding *is* the verified account, not a
+///   field of something else, and it appears as a whole identifier in any
+///   program id derived from it (`token_program.key()`).
 ///
-/// - **S2c** (new) — an `Accounts`-struct parameter passed by reference: a
-///   parameter whose type (after stripping `&` / `&mut` and lifetimes) names an
-///   `Accounts` struct in `ctx.anchor.accounts_structs` carries the same
-///   guarantees as `Context<S>`. Its `Program`-typed field names are recorded as
-///   bare names — same as S2 original. `resolve_program_id_text` expands any
-///   local let-alias (e.g. `let token_program = &accounts.token_program;` causes
-///   `token_program.key` to expand to `accounts.token_program.key`), and
-///   `whole_word_match` then finds `token_program` in the receiver portion.
+/// - **S2c** — an `Accounts`-struct parameter passed by reference
+///   (`accounts: &mut Deposit<'info>`) carries the same guarantees as
+///   `Context<S>` with the wrapper peeled off. Each `Program`-typed field is
+///   recorded as `<binding>.<field>`.
+///
+/// ## Why qualified paths, not bare field names
+///
+/// Bare names silence by coincidence. A function taking both
+/// `accounts: &mut Deposit<'info>` (where `Deposit` has a verified
+/// `token_program` field) and a raw `token_program: AccountInfo<'info>`
+/// parameter would register the string `token_program` from the struct and then
+/// match it against the *unverified* parameter of the same name. The account
+/// supplying the program id was never verified by anything, and the rule went
+/// silent — a security tool telling a lie.
+///
+/// The qualified form does not lose the let-alias resolution that motivated
+/// bare names, because `resolve_program_id_text` expands the leading identifier
+/// of the program id text before the match:
+///
+/// - `let cpi_program = ctx.accounts.auction_house_program.to_account_info();`
+///   then `program_id: cpi_program.key()` expands to
+///   `ctx.accounts.auction_house_program.to_account_info().key()`, whose
+///   receiver contains the qualified needle.
+/// - `let token_program = &accounts.token_program;` then
+///   `transfer(token_program.key, …)` expands to `accounts.token_program.key`
+///   (initialisers are `strip_ref`-ed at collection time).
+/// - `let accounts = &ctx.accounts;` then `accounts.token_program.key()`
+///   expands to `ctx.accounts.token_program.key()`.
+///
+/// `whole_word_match` handles a dotted needle correctly because `is_ident_char`
+/// is false for `.`: `ctx.accounts.token_program` matches inside
+/// `ctx.accounts.token_program.to_account_info()` but not inside
+/// `ctx.accounts.token_program_2`.
+///
+/// The one shape that stops being silenced is destructuring —
+/// `let Context { accounts, .. } = ctx;` — which `collect_let_bindings` never
+/// recorded anyway, since that is not a `Pat::Ident`.
 fn context_program_fields(sig: &syn::Signature, ctx: &RuleContext<'_>) -> Vec<String> {
     let mut fields: Vec<String> = Vec::new();
 
@@ -465,62 +539,54 @@ fn context_program_fields(sig: &syn::Signature, ctx: &RuleContext<'_>) -> Vec<St
 
         // S2 — `Context<S>` parameter.
         if let Some(struct_name) = context_struct_name(ty) {
-            if let Some(accounts_struct) = ctx
-                .anchor
-                .accounts_structs
-                .iter()
-                .find(|s| s.name == struct_name)
-            {
-                for field in accounts_struct
-                    .fields
-                    .iter()
-                    .filter(|f| f.ty == AccountTy::Program)
-                {
-                    fields.push(field.name.clone());
-                }
-            }
+            push_program_fields(
+                &mut fields,
+                ctx,
+                &struct_name,
+                &format!("{binding}.accounts"),
+            );
             continue;
         }
 
-        let syn::Type::Path(path) = ty else {
-            continue;
-        };
-        let Some(last_seg) = path.path.segments.last() else {
-            continue;
-        };
-
-        // S2b — a plain `Program<'info, T>` typed parameter.
-        // The binding name itself will appear in the program id text (e.g.
-        // `token_program.key()`) so adding it directly is the right match.
-        if last_seg.ident == "Program" {
-            fields.push(binding.clone());
-            continue;
-        }
-
-        // S2c — an Accounts-struct parameter (`accounts: &mut Deposit<'info>`).
-        // The final path segment (without generics) is the struct name.
-        let struct_name = last_seg.ident.to_string();
-        if let Some(accounts_struct) = ctx
-            .anchor
-            .accounts_structs
-            .iter()
-            .find(|s| s.name == struct_name)
-        {
-            // Emit bare field names. `resolve_program_id_text` will expand any
-            // local let-alias (`let token_program = &accounts.token_program;`),
-            // so the receiver will contain `token_program` as a whole word even
-            // when the call site uses the alias rather than the direct access.
-            for field in accounts_struct
-                .fields
-                .iter()
-                .filter(|f| f.ty == AccountTy::Program)
-            {
-                fields.push(field.name.clone());
+        // `account_ty` unwraps `Box<…>`, so `Box<Program<'info, T>>` and
+        // `Box<Deposit<'info>>` are treated exactly like their inner types.
+        match account_ty(ty) {
+            // S2b — a `Program<'info, T>` typed parameter.
+            AccountTy::Program => fields.push(binding.clone()),
+            // S2c — an Accounts-struct parameter (`accounts: &mut Deposit<'info>`).
+            AccountTy::Other(struct_name) if !struct_name.is_empty() => {
+                push_program_fields(&mut fields, ctx, &struct_name, &binding);
             }
+            _ => {}
         }
     }
 
     fields
+}
+
+/// Append `<prefix>.<field>` for every `Program`-typed field of the `Accounts`
+/// struct named `struct_name`, if such a struct is known.
+fn push_program_fields(
+    fields: &mut Vec<String>,
+    ctx: &RuleContext<'_>,
+    struct_name: &str,
+    prefix: &str,
+) {
+    let Some(accounts_struct) = ctx
+        .anchor
+        .accounts_structs
+        .iter()
+        .find(|s| s.name == struct_name)
+    else {
+        return;
+    };
+    for field in accounts_struct
+        .fields
+        .iter()
+        .filter(|f| f.ty == AccountTy::Program)
+    {
+        fields.push(format!("{prefix}.{}", field.name));
+    }
 }
 
 /// Resolve the program-id normalised text through one level of local `let`:
@@ -531,14 +597,20 @@ fn context_program_fields(sig: &syn::Signature, ctx: &RuleContext<'_>) -> Vec<St
 /// For example, `cpi_program.key()` with binding `cpi_program =
 /// ctx.accounts.auction_house_program.to_account_info()` expands to
 /// `ctx.accounts.auction_house_program.to_account_info().key()`.
-fn resolve_program_id_text(text: &str, bindings: &[LetBinding]) -> String {
+///
+/// `at` is the position of the `invoke` call, not of the `Instruction` that
+/// built the program id. That is a sound upper bound and deliberately chosen:
+/// any binding the built `Instruction` refers to must already precede the
+/// `invoke` for the code to compile, and the `invoke` position is the one
+/// [`check_body`] has to hand for both lookups.
+fn resolve_program_id_text(text: &str, bindings: &[LetBinding], at: Pos) -> String {
     // Strip leading `*` and `&` deref/borrow operators.
     let bare = text.trim_start_matches('*').trim_start_matches('&');
     // Extract the leading identifier (everything before the first `.` or end).
     let ident_end = bare.find(|c: char| !is_ident_char(c)).unwrap_or(bare.len());
     let leading_ident = &bare[..ident_end];
     let suffix = &bare[ident_end..];
-    if let Some(binding) = bindings.iter().find(|b| b.name == leading_ident) {
+    if let Some(binding) = nearest_preceding(bindings, leading_ident, at) {
         format!("{}{}", normalised(&binding.init), suffix)
     } else {
         text.to_string()
@@ -672,12 +744,21 @@ mod tests {
     /// An `invoke` of an instruction this function did not build is not a
     /// finding under T1: without a locally-constructed `Instruction`, we have
     /// no program id expression to inspect.
+    ///
+    /// The subject takes `*target_program.key` as its first argument on
+    /// purpose. With no arguments the test asserted nothing — there would be no
+    /// first argument to mistake for a program id, so both builder-name guards
+    /// could be deleted and the test would stay green.
+    ///
+    /// Killed by: removing the `PROGRAM_ID_FIRST_BUILDERS` guard (or the whole
+    /// `INSTRUCTION_BUILDERS` condition), which makes every call's first
+    /// argument a program id — and this one contains `.key`.
     #[test]
     fn invoke_of_externally_built_instruction_is_not_a_finding() {
         let f = findings(
             r#"
             pub fn claim(ctx: Context<Claim>) -> Result<()> {
-                let instruction = build_instruction();
+                let instruction = build_instruction(*target_program.key);
                 invoke(&instruction, &[a.clone(), b.clone(), target_program.clone()])?;
                 Ok(())
             }
@@ -1016,9 +1097,18 @@ mod tests {
     // ── Important 2: S2 identifier-boundary guard (whole_word_match killable) ──
 
     /// A `Route` struct with both a `Program`-typed `program` field AND an
-    /// `AccountInfo`-typed `token_program` field. The program id comes from
-    /// `token_program.key()` — the `Program` field name `program` must NOT
-    /// match inside `token_program`.
+    /// `AccountInfo`-typed `program_2` field. The program id comes from
+    /// `ctx.accounts.program_2.key()`, whose receiver contains the needle
+    /// `ctx.accounts.program` as a plain substring — only an identifier-boundary
+    /// check keeps this finding alive.
+    ///
+    /// The second field is `program_2` rather than `token_program` because S2
+    /// now registers the *qualified* access path (Important 2, round 3). With
+    /// the bare needle `program`, `token_program` was the substring case; with
+    /// the qualified needle `ctx.accounts.program` it no longer is, and this
+    /// test would have stopped killing its mutation. The suffix shape restores
+    /// exactly the property the test was written to have.
+    ///
     /// Exercises: S2 whole-word boundary guard.
     /// Killed by: replacing `whole_word_match(h, n)` with `h.contains(n)`.
     #[test]
@@ -1029,23 +1119,247 @@ mod tests {
             pub struct Route<'info> {
                 pub program: Program<'info, System>,
                 /// CHECK: not validated
-                pub token_program: AccountInfo<'info>,
+                pub program_2: AccountInfo<'info>,
             }
 
             pub fn exec(ctx: Context<Route>) -> Result<()> {
                 let ix = Instruction {
-                    program_id: ctx.accounts.token_program.key(),
+                    program_id: ctx.accounts.program_2.key(),
                     accounts: vec![],
                     data: vec![],
                 };
-                invoke(&ix, &[ctx.accounts.token_program.to_account_info()])?;
+                invoke(&ix, &[ctx.accounts.program_2.to_account_info()])?;
                 Ok(())
             }
         "#,
         );
 
-        // `token_program` is AccountInfo; `program` is Program but its name does
-        // not match `token_program` as a whole identifier — S2 must not silence this.
+        // `program_2` is AccountInfo; `program` is Program but `ctx.accounts.program`
+        // does not match `ctx.accounts.program_2` as a whole identifier — S2 must
+        // not silence this.
+        assert_eq!(f.len(), 1, "expected 1 finding, got {f:?}");
+        assert_eq!(f[0].rule_id, "VL005");
+    }
+
+    // ── Important 1 (round 3): position-aware `let` resolution ────────────────
+
+    /// Sequential shadowing. The first `invoke` uses the *safe* `ix`; a later
+    /// `let ix` rebinds the name to a dangerous value. Only the second `invoke`
+    /// may be reported, and its message must quote the expression that actually
+    /// appears in the statement it points at.
+    ///
+    /// Exercises: position-aware binding lookup (nearest strictly-preceding).
+    /// Killed by: removing the `b.pos < at` filter in `nearest_preceding`
+    /// (last-wins returns the dangerous binding for both invokes → 2 findings).
+    #[test]
+    fn sequential_shadowing_flags_only_the_later_invoke() {
+        let f = findings(
+            r#"
+            pub fn exec(ctx: Context<Exec>) -> Result<()> {
+                const SAFE: Pubkey = Pubkey::new_from_array([0u8; 32]);
+                let ix = Instruction {
+                    program_id: SAFE,
+                    accounts: vec![],
+                    data: vec![],
+                };
+                invoke(&ix, &[])?;
+                let ix = Instruction {
+                    program_id: *evil.key,
+                    accounts: vec![],
+                    data: vec![],
+                };
+                invoke(&ix, &[])?;
+                Ok(())
+            }
+        "#,
+        );
+
+        assert_eq!(f.len(), 1, "expected 1 finding, got {f:?}");
+        assert_eq!(f[0].rule_id, "VL005");
+        assert_eq!(f[0].line, 15, "the finding must sit on the second invoke");
+        assert!(
+            f[0].message.contains("*evil.key"),
+            "message must quote the program id of the reported statement; got: {}",
+            f[0].message
+        );
+    }
+
+    /// Sibling branches. `if` and `else` each build their own `ix`; only the
+    /// `else` arm is dangerous. Flattening both arms into one table reports the
+    /// safe arm as well, and quotes the *other* arm's expression.
+    ///
+    /// Exercises: position-aware binding lookup across sibling scopes.
+    /// Killed by: removing the `b.pos < at` filter in `nearest_preceding`
+    /// (both invokes then resolve to the else-arm binding → 2 findings).
+    #[test]
+    fn sibling_branches_flag_only_the_dangerous_arm() {
+        let f = findings(
+            r#"
+            pub fn exec(ctx: Context<Exec>, c: bool) -> Result<()> {
+                const SAFE: Pubkey = Pubkey::new_from_array([0u8; 32]);
+                if c {
+                    let ix = Instruction {
+                        program_id: SAFE,
+                        accounts: vec![],
+                        data: vec![],
+                    };
+                    invoke(&ix, &[])?;
+                } else {
+                    let ix = Instruction {
+                        program_id: *evil.key,
+                        accounts: vec![],
+                        data: vec![],
+                    };
+                    invoke(&ix, &[])?;
+                }
+                Ok(())
+            }
+        "#,
+        );
+
+        assert_eq!(f.len(), 1, "expected 1 finding, got {f:?}");
+        assert_eq!(f[0].rule_id, "VL005");
+        assert_eq!(
+            f[0].line, 17,
+            "the finding must sit on the else-branch invoke"
+        );
+    }
+
+    // ── Important 2 (round 3): S2 registers qualified access paths ────────────
+
+    /// S2c must not silence an unrelated account that merely shares a name with
+    /// a field of the `Accounts` struct. `Deposit::token_program` is verified;
+    /// the raw `token_program: AccountInfo` *parameter* is not, and it is the
+    /// one supplying the program id.
+    ///
+    /// Exercises: S2c qualified registration (`<binding>.<field>`).
+    /// Killed by: reverting the S2c registration to the bare `field.name`.
+    #[test]
+    fn s2c_field_name_does_not_silence_an_unrelated_raw_parameter() {
+        let f = findings(
+            r#"
+            #[derive(Accounts)]
+            pub struct Deposit<'info> {
+                pub token_program: Program<'info, Token>,
+            }
+
+            fn go<'info>(
+                accounts: &mut Deposit<'info>,
+                token_program: AccountInfo<'info>,
+            ) -> Result<()> {
+                let ix = spl_token::instruction::transfer(
+                    token_program.key,
+                    source.key,
+                    destination.key,
+                    authority.key,
+                    &[],
+                    amount,
+                )?;
+                invoke(&ix, &[])
+            }
+        "#,
+        );
+
+        // The raw parameter shadows nothing: it was never verified by Anchor.
+        assert_eq!(f.len(), 1, "expected 1 finding, got {f:?}");
+        assert_eq!(f[0].rule_id, "VL005");
+    }
+
+    /// The same hole in the plain `Context<S>` form: `Route::token_program` is
+    /// `Program`-typed, but the program id comes from a raw `token_program`
+    /// parameter of the handler, which nothing verified.
+    ///
+    /// Exercises: S2 qualified registration (`<binding>.accounts.<field>`).
+    /// Killed by: reverting the S2 registration to the bare `field.name`.
+    #[test]
+    fn s2_field_name_does_not_silence_an_unrelated_raw_parameter() {
+        let f = findings(
+            r#"
+            #[derive(Accounts)]
+            pub struct Route<'info> {
+                pub token_program: Program<'info, System>,
+            }
+
+            pub fn exec<'info>(
+                ctx: Context<Route>,
+                token_program: AccountInfo<'info>,
+            ) -> Result<()> {
+                let ix = Instruction {
+                    program_id: token_program.key(),
+                    accounts: vec![],
+                    data: vec![],
+                };
+                invoke(&ix, &[])?;
+                Ok(())
+            }
+        "#,
+        );
+
+        assert_eq!(f.len(), 1, "expected 1 finding, got {f:?}");
+        assert_eq!(f[0].rule_id, "VL005");
+    }
+
+    // ── Minor 3 (round 3): Box<Program<'info, T>> is a Program parameter ──────
+
+    /// `Box<Program<'info, Token>>` is the same verified account as
+    /// `Program<'info, Token>`; Anchor boxes large account structs routinely.
+    ///
+    /// Exercises: S2b through `account_ty`'s `Box` unwrapping.
+    /// Killed by: reverting S2b to the direct `last_seg.ident == "Program"`
+    /// comparison, which sees `Box` and does not silence.
+    #[test]
+    fn s2b_boxed_program_typed_parameter_silences_the_finding() {
+        let f = findings(
+            r#"
+            pub fn bid_logic<'info>(
+                token_program: Box<Program<'info, Token>>,
+            ) -> Result<()> {
+                invoke_signed(
+                    &spl_token::instruction::transfer(
+                        &token_program.key(),
+                        source.key,
+                        destination.key,
+                        authority.key,
+                        &[],
+                        amount,
+                    )?,
+                    &[source.clone(), destination.clone()],
+                    &[],
+                )
+            }
+        "#,
+        );
+
+        assert!(f.is_empty(), "unexpected findings: {f:?}");
+    }
+
+    // ── Minor 4 (round 3): closures are walked for let bindings ──────────────
+
+    /// `CpiFinder` uses `visit_block`, which descends into closures, so the
+    /// `invoke` below is found. The binding walk must agree, or the `ix` hop is
+    /// lost and the CPI silently disappears.
+    ///
+    /// Exercises: the `Expr::Closure` arm of `collect_let_bindings_expr` (and
+    /// the descent into `let` initialisers that makes it reachable).
+    /// Killed by: removing the `syn::Expr::Closure` arm.
+    #[test]
+    fn cpi_inside_a_closure_is_found() {
+        let f = findings(
+            r#"
+            pub fn exec(ctx: Context<Exec>) -> Result<()> {
+                let send = || {
+                    let ix = Instruction {
+                        program_id: *ctx.accounts.prog.key,
+                        accounts: vec![],
+                        data: vec![],
+                    };
+                    invoke(&ix, &[])
+                };
+                send()
+            }
+        "#,
+        );
+
         assert_eq!(f.len(), 1, "expected 1 finding, got {f:?}");
         assert_eq!(f[0].rule_id, "VL005");
     }
@@ -1113,20 +1427,22 @@ mod tests {
     }
 
     /// Shadowing: the second (later) `let ix = …` binds the dangerous value.
-    /// Without last-wins, resolving `ix` returns the safe first binding and the
-    /// invoke after the shadowing is silenced. With last-wins, the dangerous
-    /// binding wins and the invoke fires.
+    /// Under first-wins, resolving `ix` returns the safe first binding and the
+    /// invoke after the shadowing goes silent. Under nearest-preceding, the
+    /// dangerous binding is the one immediately above the call, so it fires.
     ///
-    /// Trade-off: last-wins also makes the invoke *before* the shadowing fire
-    /// (it resolves to the same final dangerous binding), which is a false
-    /// positive on the first invoke. That is the accepted trade for ensuring the
-    /// dangerous invoke never goes silent. This test verifies the critical
-    /// direction: the invoke after shadowing must fire.
+    /// Round 1 achieved this with last-wins, which had a matching defect in the
+    /// other direction: an invoke *before* the shadowing resolved to the later
+    /// dangerous binding and was reported as a false positive. Round 3 replaced
+    /// both with position-aware lookup, and
+    /// `sequential_shadowing_flags_only_the_later_invoke` covers that direction.
+    /// This test still asserts the critical one: the invoke after shadowing
+    /// must fire.
     ///
-    /// Exercises: shadowing resolution (last-wins).
-    /// Killed by: switching to first-wins semantics (bindings.iter().find returns
-    /// earliest), which would resolve to the safe binding for ALL invokes and
-    /// produce 0 findings.
+    /// Exercises: shadowing resolution (nearest preceding binding).
+    /// Killed by: replacing `max_by_key` with `min_by_key` in
+    /// `nearest_preceding` (first-wins), which resolves to the safe binding and
+    /// produces 0 findings.
     #[test]
     fn shadowed_binding_resolves_to_latest_value() {
         // Only one invoke, after the shadowing: must fire.
