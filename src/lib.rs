@@ -213,4 +213,112 @@ pub fn create(ctx: Context<Create>) -> Result<()> {
 
         assert!(report.findings.is_empty(), "{:?}", report.findings);
     }
+
+    // ── Scope wiring: end-to-end tests that drive the real scan pipeline ─────
+    //
+    // These tests are the authoritative check that the scope guards are actually
+    // wired into the scan loop.  The unit tests in scope.rs call the primitives
+    // directly; only these tests can fail when the guards are removed from lib.rs.
+    //
+    // The finding shape used is VL004 (`create_program_address`), which fires on
+    // a simple free function with no AST-level test-gate inside the rule itself.
+
+    /// A `create_program_address` call that VL004 fires on.
+    const CPA: &str = "pub fn f(seeds: &[&[u8]], id: &Pubkey) -> Pubkey {\n    Pubkey::create_program_address(seeds, id).unwrap()\n}\n";
+
+    /// M4 wiring: a finding inside an inline `#[cfg(test)] mod tests { … }` block
+    /// is suppressed; an identical finding outside survives.
+    ///
+    /// Killing mutation: replace `&& !scope::in_test_range(finding.line, &test_ranges)`
+    /// with `&& true` at the phase-1 `retain` call in `lib.rs` — two findings are
+    /// then reported instead of one.
+    #[test]
+    fn scope_m4_wiring_inline_cfg_test_block_suppresses_finding() {
+        // The source has two identical `create_program_address` calls:
+        //   Line 2: outside the cfg(test) mod — this finding survives.
+        //   Line 7: inside `#[cfg(test)] mod tests { … }` — this finding is dropped.
+        let source = "\
+pub fn outside(seeds: &[&[u8]], id: &Pubkey) -> Pubkey {
+    Pubkey::create_program_address(seeds, id).unwrap()
+}
+#[cfg(test)]
+mod tests {
+    pub fn inside(seeds: &[&[u8]], id: &Pubkey) -> Pubkey {
+        Pubkey::create_program_address(seeds, id).unwrap()
+    }
+}
+";
+        let dir = std::env::temp_dir().join("vaultlint_scope_m4_wiring");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("lib.rs"), source).unwrap();
+
+        let report = scan(&ScanOptions { root: dir });
+
+        // Exactly one finding: the outside call on line 2.
+        assert_eq!(
+            report.findings.len(),
+            1,
+            "expected exactly one finding (inside the cfg(test) block must be suppressed): {:?}",
+            report.findings
+        );
+        assert_eq!(report.findings[0].rule_id, "VL004");
+        assert_eq!(
+            report.findings[0].line, 2,
+            "surviving finding must be the outside call on line 2"
+        );
+    }
+
+    /// M1 wiring: a `Cargo.toml`-rooted tree; a finding in `tests/it.rs` is
+    /// suppressed (M1), while the identical finding in `src/lib.rs` survives.
+    ///
+    /// Also covers M3: `src/lib.rs` contains `#[cfg(test)] mod unit;` and
+    /// `src/unit.rs` carries the same finding — that finding is also suppressed.
+    ///
+    /// Killing mutation: replace `if scope::is_test_scope(&path, &m3_set) {`
+    /// with `if false {` — both the M1 and M3 findings then survive, giving
+    /// three findings instead of one.
+    #[test]
+    fn scope_m1_m3_wiring_skips_test_and_cfg_test_files() {
+        let dir = std::env::temp_dir().join("vaultlint_scope_m1_m3_wiring");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("tests")).unwrap();
+
+        // Minimal Cargo.toml so M1 can find the crate root.
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+
+        // src/lib.rs: real on-chain code with a finding; also declares cfg(test) mod unit.
+        fs::write(
+            dir.join("src/lib.rs"),
+            format!("{CPA}#[cfg(test)]\nmod unit;\n"),
+        )
+        .unwrap();
+
+        // tests/it.rs: M1 integration-test file — finding must be suppressed.
+        fs::write(dir.join("tests/it.rs"), CPA).unwrap();
+
+        // src/unit.rs: M3 file (declared as #[cfg(test)] mod unit;) — finding must be suppressed.
+        fs::write(dir.join("src/unit.rs"), CPA).unwrap();
+
+        let report = scan(&ScanOptions { root: dir });
+
+        // Exactly one finding: the call in src/lib.rs.
+        assert_eq!(
+            report.findings.len(),
+            1,
+            "expected exactly one finding (tests/it.rs and src/unit.rs must be suppressed): {:?}",
+            report.findings
+        );
+        assert_eq!(report.findings[0].rule_id, "VL004");
+        assert!(
+            report.findings[0].file.ends_with("lib.rs"),
+            "surviving finding must be in src/lib.rs, got: {:?}",
+            report.findings[0].file
+        );
+    }
 }

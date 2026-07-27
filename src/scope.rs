@@ -195,6 +195,16 @@ fn is_m2(file: &Path) -> bool {
 
 /// For each `#[cfg(test)] mod NAME;` item in `ast` (a module with no body),
 /// resolve the target file and insert it into `set`.
+///
+/// Known limitations (safe direction — missed suppression is a possible false
+/// positive, never a missed vulnerability):
+/// - Only walks `ast.items` at the top level of the file. A `#[cfg(test)] mod
+///   tests;` nested inside an inline module (`mod foo { mod tests; }`) is not
+///   collected. In practice all declaration sites observed in the corpus are
+///   top-level.
+/// - Does not handle `#[path = "…"]` overrides. A `#[cfg(test)]
+///   #[path = "my_tests.rs"] mod tests;` is collected under the wrong name and
+///   the actual file is not suppressed.
 fn collect_cfg_test_mods(ast: &syn::File, dir: &Path, set: &mut HashSet<PathBuf>) {
     for item in &ast.items {
         let syn::Item::Mod(item_mod) = item else {
@@ -225,6 +235,12 @@ fn collect_cfg_test_mods(ast: &syn::File, dir: &Path, set: &mut HashSet<PathBuf>
 }
 
 /// Recursively inserts all `.rs` files under `dir` into `set`.
+///
+/// Note: this intentionally recurses the whole `NAME/` subtree without stopping
+/// at nested `Cargo.toml` boundaries or honouring `scan.rs`'s `target`/dot-dir
+/// exclusions. A sub-crate nested beneath a `#[cfg(test)] mod` directory is
+/// still considered test scope. This is deliberate: the declaration site marks
+/// the whole subtree.
 fn insert_dir_contents(dir: PathBuf, set: &mut HashSet<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
@@ -404,14 +420,8 @@ mod tests {
 
     /// A file declared as `#[cfg(test)] mod tests;` is test scope.
     ///
-    /// Killing mutation: remove the `attrs_have_cfg_test` check in
-    /// `collect_cfg_test_mods` so every `mod NAME;` is added to the set.
-    /// (That mutation makes the negative test below pass as test scope, which is
-    /// wrong — but it does NOT kill this test. The brief asks for the mutation
-    /// that kills THIS test: remove the cfg-test check so the set is never
-    /// populated — wait, that also wouldn't kill it if we remove the guard
-    /// entirely… The actual killing mutation is: change `attrs_have_cfg_test` to
-    /// always return false, so the set is never populated.)
+    /// Killing mutation: make `attrs_have_cfg_test` always return `false` so
+    /// nothing is ever added to the M3 set.
     #[test]
     fn m3_fires_for_cfg_test_mod_declaration() {
         let dir = tmp_dir("m3_fires");
@@ -459,9 +469,12 @@ mod tests {
     /// `InlineTestVisitor::visit_item_mod`, making every inline mod a test range.
     #[test]
     fn m4_drops_finding_inside_cfg_test_block_and_keeps_finding_outside() {
-        // Line 2: the `mod` keyword (start of range)
-        // Line 4: `}` (end of range)
-        // Line 6: outside the block
+        // Line 1: `fn outside() {}`          — outside the block
+        // Line 2: `#[cfg(test)]`             — attribute
+        // Line 3: `mod tests {`              — start of range (the `mod` keyword)
+        // Line 4: `    fn inside() {}`       — inside the block
+        // Line 5: `}`                        — end of range (closing brace)
+        // Line 6: `fn also_outside() {}`     — outside the block
         let source = "\
 fn outside() {}
 #[cfg(test)]
@@ -474,6 +487,15 @@ fn also_outside() {}
         let ranges = test_ranges(&ast);
         assert!(!ranges.is_empty(), "must detect the inline test block");
 
+        // The range must include the `mod` line (3) and the closing-brace line (5).
+        assert!(
+            in_test_range(3, &ranges),
+            "line 3 (mod keyword) must be inside the test block"
+        );
+        assert!(
+            in_test_range(5, &ranges),
+            "line 5 (closing brace) must be inside the test block"
+        );
         // Line 4 (`fn inside() {}`) is inside the block.
         assert!(
             in_test_range(4, &ranges),
