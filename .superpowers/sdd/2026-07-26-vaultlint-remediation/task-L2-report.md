@@ -371,3 +371,152 @@ None blocking. Two things worth knowing:
   exactly one additional finding — the intended one. Not worth chasing with dataflow.
 - The `/tmp/vl-marginfi-prefix` worktree is left registered against `/tmp/vl-real/marginfi-v2`.
   If a later task wants the tree clean, `git worktree remove /tmp/vl-marginfi-prefix`.
+
+---
+
+# Fix round 2 — the struct-literal idiom, UTF-8 safety, four untested spec branches
+
+Status: **DONE**. Four review findings addressed; corpus unchanged at the stated baseline.
+
+## Critical 1 — `contains_access` was blind to `set_inner(T { authority: … })`
+
+`contains_access` rejected a match whose left neighbour was `:`. That rule is right for
+*attribute* text, where a lone `:` cannot occur and so is always half of a `::`. It is
+wrong for *handler body* text, where `:` is also the struct-literal field separator and
+`body_text` glues tokens together:
+
+```
+ctx.accounts.record.set_inner(Record { authority: ctx.accounts.authority.key() })
+→ …set_inner(Record{authority:ctx.accounts.authority.key()})
+```
+
+The sole occurrence of the needle was `:`-prefixed, so T5 failed and the whole idiom —
+one of the two canonical ways an Anchor handler writes a designated authority into
+freshly `init`ed state — was silently missed. (The bare spelling did not rescue it: the
+`authority.key()` inside `ctx.accounts.authority.key()` is `.`-prefixed and correctly
+rejected.)
+
+**Choice made: shared *walk*, separate *boundaries*.** The reviewer offered a shared
+predicate or two functions; neither on its own was right. The bug that mattered was in the
+boundary rule, which genuinely differs between the two texts, while the defect in
+Important 2 was in the walk, which is identical in both and is the delicate part. So:
+
+- new `find_bounded(text, needle, left, right)` owns the walk and is shared;
+- `name_in_seeds` and `contains_access` each keep their own boundary predicates, with
+  `no_identifier_or_member_before` (the identifier / `.` rules, which really are common)
+  factored out and the `:` rules stated separately in each, each with the reason.
+
+`name_in_seeds` behaviour is byte-for-byte unchanged: it still rejects both a left `:` and
+a right `:`. `contains_access` now rejects only `::` on the left (`left` ends in `:` whose
+own left neighbour is `:`), and accepts a lone `:`.
+
+`a_longer_receiver_is_not_the_account_we_are_tracking` still passes — the `.` left boundary
+is untouched.
+
+## Important 2 — panic on user-supplied source
+
+Both scanners resumed a failed match at `at + 1` and then sliced. Rust identifiers may hold
+any XID character (`pub émetteur_authority: UncheckedAccount<'info>` is legal), so a
+`.`-prefixed first match of `émetteur_authority` left `start` inside the `é` and the next
+slice panicked. Nothing in `src/` catches unwinds, so one exotic file aborted the entire
+scan.
+
+`find_bounded` resumes at `at + needle.len()`, which is always a char boundary (it is the
+end of a `str::find` match) and is provably equivalent: a later match starting inside this
+one has a needle character to its left, and every needle used here begins with an
+identifier character, so it would fail `left` anyway. The reasoning is recorded on the
+function.
+
+Also fixed there: `haystack.as_bytes()[at - 1] as char` read one byte and cast it, so the
+`é` of `caféauthority` was seen as `©` — not an identifier character — and the match was
+wrongly accepted as a reference to a field named `authority`. Both predicates now take the
+surrounding `&str` and use `chars().next_back()` / `chars().next()`.
+
+## Important 3 — four spec branches now pinned
+
+Added, all expecting zero findings: `own_seeds_silence_the_finding` (S1 `Seeds`),
+`an_own_signer_constraint_silences_the_finding` (S1 `signer`),
+`an_own_address_constraint_silences_the_finding` (S1 `address`), and
+`a_namespaced_constraint_on_a_settled_sibling_silences_the_finding` (S2's
+`Constraint::Other(key, value)` arm, `token::authority = authority` on a non-`init`
+sibling).
+
+## Minor 4 — the comment on `spellings`
+
+Reworded. It previously said the looseness "errs towards silence … the direction we want".
+It now states the trade in both directions, names the false negative concretely
+(`let authority = &ctx.accounts.other; require!(authority.is_signer)`), says plainly that a
+false negative is the worse of the two in a security linter, and justifies accepting it on
+the measurement (one changed finding across seven trees) rather than by calling it safe.
+
+## Tests
+
+`cargo test`: **120 passed, 0 failed** (116 lib + 4 integration), up from 111. Nine new
+tests. `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean.
+
+All four new-behaviour tests were written first and observed to fail for the right reason:
+two boundary assertions failed, and `a_non_ascii_field_name_is_scanned_without_panicking`
+failed with `byte index 8 is not a char boundary; it is inside 'é'`.
+
+### The mutation that kills each new test
+
+Each mutation was applied to the shipped source, `cargo test --lib init_authority` run, and
+the source restored from a byte-identical backup (`diff` clean afterwards).
+
+| Test | Mutation | Fails |
+|---|---|---|
+| `a_struct_literal_write_is_still_a_read_of_the_field` | `contains_access` left: `&& !left.strip_suffix(':').is_some_and(\|l\| l.ends_with(':'))` → `&& !left.ends_with(':')` | yes (with the `contains_access` unit test) |
+| `an_is_signer_check_beside_a_struct_literal_write_silences_the_finding` | delete `if body.reads_field(field, "is_signer") { return true; }` from `establishes_signer` | yes (with the three round-1 direct-`is_signer` tests) |
+| `a_struct_literal_separator_is_not_a_path_separator` | delete the same `::` clause entirely (accept `::` too) | yes |
+| `own_seeds_silence_the_finding` | `Constraint::Seeds(_) \| Constraint::Custom(_) => true` → `Constraint::Custom(_) => true` | yes, alone |
+| `an_own_signer_constraint_silences_the_finding` | `key == "signer" \|\| key == "address"` → `key == "address"` | yes, alone |
+| `an_own_address_constraint_silences_the_finding` | `key == "signer" \|\| key == "address"` → `key == "signer"` | yes, alone |
+| `a_namespaced_constraint_on_a_settled_sibling_silences_the_finding` | delete `Constraint::Other(key, value) => key.contains("::") && value == name,` from `bound_by_settled_sibling` | yes, alone |
+| `a_non_ascii_field_name_is_scanned_without_panicking` | `start = end;` → `start = at + 1;` in `find_bounded` | yes, alone (panics) |
+| `a_multi_byte_left_neighbour_still_continues_an_identifier` | `left.chars().next_back()` → `left.as_bytes().last().map(\|b\| *b as char)` | yes, alone |
+
+**The Critical 1 pair is killed by disjoint mutations**, as required. Row 1's mutation
+leaves the suppression test passing (with `:` rejected again, T5 fails, the struct still
+reports nothing and zero is what that test expects); row 2's mutation leaves the trigger
+test passing (S4 is irrelevant to it). Neither test alone proves the symmetry; together
+they do.
+
+## Corpus re-run
+
+Release build, `vaultlint scan <repo> --format json --fail-on never`. Every tree listed was
+present; nothing was substituted.
+
+| Codebase | VL001 | baseline | file:line |
+|---|---|---|---|
+| `/tmp/vl-real/liquid-staking-program` | 0 | 0 | — |
+| `/tmp/vl-real/marginfi-v2` (HEAD) | 0 | 0 | — |
+| `/tmp/vl-real/openbook-v2` | 0 | 0 | — |
+| `/tmp/vl-real/protocol-v2` (drift) | 2 | 2 | `programs/drift/src/instructions/user.rs:4530`, `:5225` |
+| `/tmp/vl-real/squads-mpl` | 0 | 0 | — |
+| `/tmp/anchor-check` | 1 | 1 | `tests/auction-house/programs/auction-house/src/lib.rs:1098` |
+| `/tmp/vl-marginfi-prefix` (marginfi @ `95a4c26^`) | 1 | 1 | `programs/marginfi/src/instructions/marginfi_account/initialize.rs:114` |
+
+**No new findings, and no lost ones.** Nothing was tuned to achieve that; the rule change
+was written and its tests fixed before the corpus was scanned.
+
+Why Critical 1 adds nothing here, checked rather than assumed: the struct-literal write
+*does* occur in this corpus — `marginfi-v2/programs/mocks/src/instructions/pda_account_creation.rs:73`
+is `authority: ctx.accounts.authority.key()` inside a struct literal, and drift's
+`user.rs` has a dozen more. None of them reaches T5, because the field is disqualified
+earlier: the marginfi mock declares `pub authority: Signer<'info>` (T1), and drift's are
+inside events and non-`init` structs. So the fix is exercised against real code and changes
+no verdict on it; the idiom it unblocks is simply not the spelling these particular
+programs use for the vulnerable shape. The `/tmp/vl-marginfi-prefix` worktree is untouched
+and still registered.
+
+## Concerns
+
+None blocking.
+
+- Widening `contains_access` to accept a lone `:` also widens **S4** and the forwarding hop,
+  which silence findings — a struct literal such as `Ctx { authority: x.is_signer }` now
+  reads as a signer check. That is the same symmetry round 1 established deliberately, it
+  is what the added inverse test pins, and it cost zero findings on the corpus.
+- The two review items ruled out of scope are untouched: the bare-name aliasing risk (now
+  honestly described in the `spellings` comment rather than defended) and
+  `linked_findings_for_files` leaking its temp directory on a test panic.
