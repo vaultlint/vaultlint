@@ -128,7 +128,7 @@ fn fn_fact(self_ty: Option<&syn::Type>, sig: &syn::Signature) -> FnFact {
 /// Take the last generic argument, ignoring lifetimes, then its final path
 /// segment without generics. `Context` is matched as the *final* segment of the
 /// parameter type so `anchor_lang::context::Context<…>` matches too.
-fn context_struct_name(ty: &syn::Type) -> Option<String> {
+pub(crate) fn context_struct_name(ty: &syn::Type) -> Option<String> {
     let syn::Type::Path(path) = ty else {
         return None;
     };
