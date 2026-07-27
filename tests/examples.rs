@@ -45,6 +45,7 @@ fn every_vulnerable_example_is_detected_at_the_expected_line() {
             "examples/vulnerable/missing_owner.rs".to_string(),
             5,
         ),
+        ("VL003".to_string(), "Cargo.toml".to_string(), 1),
         (
             "VL003".to_string(),
             "examples/vulnerable/unchecked_math.rs".to_string(),

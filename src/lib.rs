@@ -9,6 +9,7 @@ pub mod scope;
 pub mod suppress;
 pub mod usesite;
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use finding::Finding;
@@ -34,6 +35,7 @@ pub struct ScanReport {
 
 pub fn scan(options: &ScanOptions) -> ScanReport {
     let project = project::detect(&options.root);
+    let workspace_resolver = project::WorkspaceResolver::new();
     let rules = rules::all();
     let linked_rules = rules::linked_all();
     let mut findings = Vec::new();
@@ -42,6 +44,7 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
     let mut test_files_skipped = 0;
     let mut index = UseSiteIndex::empty();
     let mut linked_files = Vec::new();
+    let mut roots_without_overflow_checks: BTreeSet<PathBuf> = BTreeSet::new();
 
     // Collect all candidate files first so M3 can be resolved across the tree.
     let all_files = scan::rust_files(&options.root);
@@ -62,13 +65,14 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
                 // M4: compute inline #[cfg(test)] mod ranges for this file.
                 let test_ranges = scope::test_ranges(&file.ast);
 
+                let workspace = workspace_resolver.resolve(&file.path);
                 let anchor = anchor::build(&file.ast);
                 let ctx = RuleContext {
                     path: &file.path,
                     source: &file.source,
                     ast: &file.ast,
                     anchor: &anchor,
-                    overflow_checks: project.overflow_checks,
+                    overflow_checks: workspace.overflow_checks,
                 };
                 let mut file_findings = Vec::new();
                 for rule in &rules {
@@ -78,6 +82,18 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
                     !suppress::is_suppressed(&file.source, finding)
                         && !scope::in_test_range(finding.line, &test_ranges)
                 });
+
+                if !workspace.overflow_checks {
+                    if let Some(manifest) = &workspace.manifest {
+                        if file_findings
+                            .iter()
+                            .any(|finding| finding.rule_id == "VL003")
+                        {
+                            roots_without_overflow_checks.insert(manifest.clone());
+                        }
+                    }
+                }
+
                 findings.append(&mut file_findings);
 
                 if !anchor.accounts_structs.is_empty() {
@@ -90,6 +106,10 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
                 reason: error.to_string(),
             }),
         }
+    }
+
+    for manifest in &roots_without_overflow_checks {
+        findings.push(rules::arithmetic::overflow_checks_finding(manifest));
     }
 
     // Phase 2: only files declaring an `Accounts` struct can produce a linked
@@ -320,5 +340,78 @@ mod tests {
             "surviving finding must be in src/lib.rs, got: {:?}",
             report.findings[0].file
         );
+    }
+
+    const UNCHECKED_WRITE: &str = "\
+pub fn withdraw(vault: &mut Vault, amount: u64) {
+    vault.balance = vault.balance - amount;
+}
+";
+
+    /// Two `.rs` files each with one unchecked write and no `overflow-checks` in
+    /// the root manifest → exactly 3 VL003 findings (2 Low per-op + 1 Medium at
+    /// the manifest).
+    ///
+    /// Kills both the emission loop (0 project findings) and the `BTreeSet`
+    /// de-duplication (2 project findings).
+    #[test]
+    fn emits_one_project_finding_for_a_workspace_missing_overflow_checks() {
+        let dir = std::env::temp_dir().join("vaultlint_vl003_project_finding");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        fs::write(dir.join("a.rs"), UNCHECKED_WRITE).unwrap();
+        fs::write(dir.join("b.rs"), UNCHECKED_WRITE).unwrap();
+
+        let report = scan(&ScanOptions { root: dir.clone() });
+
+        let vl003: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "VL003")
+            .collect();
+        assert_eq!(vl003.len(), 3, "expected 2 per-op + 1 project: {:?}", vl003);
+
+        let medium: Vec<_> = vl003
+            .iter()
+            .filter(|f| f.severity == crate::finding::Severity::Medium)
+            .collect();
+        assert_eq!(medium.len(), 1, "exactly one Medium (project-level)");
+        assert!(
+            medium[0].file.ends_with("Cargo.toml"),
+            "project finding must point at Cargo.toml"
+        );
+
+        let low: Vec<_> = vl003
+            .iter()
+            .filter(|f| f.severity == crate::finding::Severity::Low)
+            .collect();
+        assert_eq!(low.len(), 2, "exactly two Low (per-op)");
+    }
+
+    /// Same tree but with `overflow-checks = true` → zero VL003 findings.
+    ///
+    /// Kills the per-file threading of `overflow_checks` into `RuleContext`.
+    #[test]
+    fn a_workspace_with_overflow_checks_produces_no_vl003() {
+        let dir = std::env::temp_dir().join("vaultlint_vl003_overflow_checks_on");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[profile.release]\noverflow-checks = true\n",
+        )
+        .unwrap();
+        fs::write(dir.join("a.rs"), UNCHECKED_WRITE).unwrap();
+        fs::write(dir.join("b.rs"), UNCHECKED_WRITE).unwrap();
+
+        let report = scan(&ScanOptions { root: dir });
+
+        let vl003: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "VL003")
+            .collect();
+        assert!(vl003.is_empty(), "expected no VL003 findings: {:?}", vl003);
     }
 }
