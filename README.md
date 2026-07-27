@@ -74,7 +74,7 @@ Exit codes make it CI-ready: `0` when nothing exceeds the threshold, `1` when it
 | [VL002](https://vaultlint.com/rules/VL002) | High | Account data deserialised without an owner check |
 | [VL003](https://vaultlint.com/rules/VL003) | Medium | Unchecked `+ - *` written into account state |
 | [VL004](https://vaultlint.com/rules/VL004) | Medium | PDAs validated with a caller-supplied bump (`bump = <instruction arg>`) |
-| [VL005](https://vaultlint.com/rules/VL005) | Medium | `invoke` / `invoke_signed` without program id verification |
+| [VL005](https://vaultlint.com/rules/VL005) | Medium | A CPI whose program id comes from an account the caller controls |
 
 Every rule is deliberately narrow. A linter that cries wolf on healthy code gets
 uninstalled the same day, so vaultlint prefers a missed finding to a false one.
@@ -99,6 +99,18 @@ that verifies `is_signer` further away will be flagged; a field forwarded throug
 `remaining_accounts` is invisible; permissionless-by-design is indistinguishable from
 a bug without protocol context, so confirm intent rather than assuming a
 vulnerability; and it only considers fields named like authorities.
+
+**VL005 does not flag every unverified `invoke`.** It flags a CPI whose `Instruction`
+was built in that same function body and whose `program_id` came from an account —
+the only shape where a developer has something to verify. A CPI built by an SDK
+builder that compiles in its own program id is not reported, because there is nothing
+actionable to say about it. The exception, and the reason the rule still catches the
+textbook case, is the `spl_token` family: those builders take `token_program_id` as
+their *first argument*, so passing an unverified account there is exactly the
+Sealevel `arbitrary-cpi` bug. Accounts typed `Program<'info, T>` are silent — Anchor
+checks that id itself — and so are CPI helpers taking a `CpiContext`, where the
+caller, not the helper, owns the check. Across the same corpus this took VL005 from
+324 findings to 21.
 
 Silence a specific finding with a comment on its own line, or anywhere in the
 block of comments and attributes directly above it:
