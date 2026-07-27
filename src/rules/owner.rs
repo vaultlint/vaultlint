@@ -9,8 +9,17 @@
 //!   and the second is by far the more common in application code. The check
 //!   must therefore appear in a checking *position*: a comparison, an
 //!   assertion macro, or a call to an owner-checking helper.
-//! * the **raw-read signal** ([`reads_account_data`]) — is a deserialiser being
+//! * the **raw-read signal** ([`RawReadFinder`]) — is a deserialiser being
 //!   handed the account's raw bytes, either inline or through one `let` hop?
+//! * two **per-read silencers**, which need to know *which account* the bytes
+//!   came from and so cannot live in [`has_owner_check`]:
+//!   [`pda_address_check_covers`] (the body derives the account's address from
+//!   this program's own id and compares it) and
+//!   [`anchor_address_constraint_covers`] (the `#[derive(Accounts)]` struct
+//!   pins the field's address, so Anchor checked it before the body ran).
+//!   Both are address checks, and an address check is not weaker than an owner
+//!   check: only this program can sign for its own PDA, so data sitting at that
+//!   address was put there by this program.
 //!
 //! Deliberately out of scope: [`is_deserialiser`] matches only
 //! `syn::Expr::Call` with a path callee, so the *method* form
@@ -23,10 +32,24 @@
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
+use crate::anchor::{AccountsStruct, Constraint};
 use crate::finding::{Finding, Severity};
-use crate::rules::{is_ident_char, normalised, Rule, RuleContext};
+use crate::rules::{is_ident_char, normalised, whole_word_match, Rule, RuleContext};
+use crate::usesite::context_struct_name;
 
 const DESERIALISERS: &[&str] = &["try_from_slice", "try_deserialize", "deserialize"];
+
+/// Calls that derive a program address. Their presence is what turns a pubkey
+/// comparison into a proof of ownership: only the deriving program can sign for
+/// the address it derives.
+const PDA_DERIVATIONS: &[&str] = &[
+    "find_program_address",
+    "create_program_address",
+    "assert_derivation",
+];
+
+/// How an `Accounts` struct's fields are addressed inside a handler body.
+const ACCOUNTS_PATH: &str = ".accounts.";
 
 /// Macros whose arguments are an assertion. A `.owner` mentioned inside one of
 /// these is being checked, not merely read.
@@ -56,7 +79,11 @@ impl Rule for MissingOwnerCheck {
     }
 
     fn check(&self, ctx: &RuleContext<'_>, out: &mut Vec<Finding>) {
-        let mut visitor = FunctionVisitor { ctx, out };
+        let mut visitor = FunctionVisitor {
+            ctx,
+            out,
+            impl_self_ty: None,
+        };
         visitor.visit_file(ctx.ast);
     }
 }
@@ -64,22 +91,37 @@ impl Rule for MissingOwnerCheck {
 struct FunctionVisitor<'a, 'ctx> {
     ctx: &'a RuleContext<'ctx>,
     out: &'a mut Vec<Finding>,
+    /// Final path segment of the enclosing `impl` block's self type, so that a
+    /// handler declared `ctx: Context<Self>` can still be resolved to its
+    /// `Accounts` struct. Squads-v4 writes every account-closing instruction
+    /// that way, and without this the struct lookup would find nothing.
+    impl_self_ty: Option<String>,
 }
 
 impl FunctionVisitor<'_, '_> {
-    fn check_body(&mut self, block: &syn::Block) {
+    fn check_body(&mut self, sig: &syn::Signature, block: &syn::Block) {
         if has_owner_check(block) {
             return;
         }
-        let raw_read_locals = collect_raw_read_locals(block);
+        let ctx = self.ctx;
+        let accounts = context_accounts_struct(ctx, self.impl_self_ty.as_deref(), sig);
+        let bindings = collect_let_bindings(block);
+        let raw_read_locals = raw_read_locals(&bindings);
         let mut finder = RawReadFinder {
-            spans: Vec::new(),
+            reads: Vec::new(),
+            bindings: &bindings,
             raw_read_locals: &raw_read_locals,
         };
         finder.visit_block(block);
-        for span in finder.spans {
+        let evidence = AddressEvidence::of(block);
+        for read in finder.reads {
+            if pda_address_check_covers(&read, &evidence)
+                || anchor_address_constraint_covers(&read, accounts)
+            {
+                continue;
+            }
             self.out.push(
-                self.ctx.finding(
+                ctx.finding(
                     "VL002",
                     Severity::High,
                     "missing owner check",
@@ -88,7 +130,7 @@ impl FunctionVisitor<'_, '_> {
                         .to_string(),
                     "Use `Account<'info, T>`, which checks the owner and discriminator, \
                  or add `require_keys_eq!(*account.owner, crate::ID)` before reading.",
-                    span,
+                    read.span,
                 ),
             );
         }
@@ -97,12 +139,53 @@ impl FunctionVisitor<'_, '_> {
 
 impl<'ast> Visit<'ast> for FunctionVisitor<'_, '_> {
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        self.check_body(&node.block);
+        self.check_body(&node.sig, &node.block);
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        self.check_body(&node.block);
+        self.check_body(&node.sig, &node.block);
     }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        let outer = self.impl_self_ty.take();
+        self.impl_self_ty = type_final_segment(&node.self_ty);
+        visit::visit_item_impl(self, node);
+        self.impl_self_ty = outer;
+    }
+}
+
+/// The `Accounts` struct behind this function's `Context<S>` parameter, if the
+/// file declares one. `Context<Self>` resolves through the enclosing `impl`.
+fn context_accounts_struct<'a>(
+    ctx: &'a RuleContext<'_>,
+    impl_self_ty: Option<&str>,
+    sig: &syn::Signature,
+) -> Option<&'a AccountsStruct> {
+    let name = sig.inputs.iter().find_map(|arg| {
+        let syn::FnArg::Typed(typed) = arg else {
+            return None;
+        };
+        context_struct_name(&typed.ty)
+    })?;
+    let name = if name == "Self" {
+        impl_self_ty?.to_string()
+    } else {
+        name
+    };
+    ctx.anchor
+        .accounts_structs
+        .iter()
+        .find(|accounts| accounts.name == name)
+}
+
+fn type_final_segment(ty: &syn::Type) -> Option<String> {
+    let syn::Type::Path(path) = ty else {
+        return None;
+    };
+    path.path
+        .segments
+        .last()
+        .map(|segment| segment.ident.to_string())
 }
 
 // ─── silencer ────────────────────────────────────────────────────────────────
@@ -183,48 +266,57 @@ fn mentions_owner(ident: &syn::Ident) -> bool {
     name.contains("owner") || name.contains("owned")
 }
 
-// ─── raw-read locals ─────────────────────────────────────────────────────────
+// ─── let bindings ────────────────────────────────────────────────────────────
 
-/// Names of the body's local `let` bindings whose initialiser reads raw account
-/// data, so that the dominant real shape
+/// One `let` binding of the body, with its initialiser reduced to normalised,
+/// deref-stripped text.
+struct LetBinding {
+    name: String,
+    init: String,
+}
+
+/// Every local `let` binding of the body, so that the dominant real shape
 ///
 /// ```ignore
 /// let data = token_account_info.try_borrow_data()?;
 /// let account = SplTokenAccount::try_from_slice(&data)?;
 /// ```
 ///
-/// is recognised as one read rather than two unrelated statements.
+/// is recognised as one read rather than two unrelated statements, and so that
+/// an alias — `let proposal = &mut ctx.accounts.proposal;` — can be resolved
+/// back to the struct field it names.
 ///
 /// This is deliberately **not** shared with `cpi.rs`'s `collect_let_bindings`.
-/// That collector keeps whole initialiser expressions and source positions
+/// That collector keeps whole initialiser *expressions* and source positions
 /// because VL005 has to substitute them and resolve a name as of a call's own
-/// position; VL002 needs nothing but a set of names, and no position, because
-/// a binding holding raw bytes taints the read wherever the deserialiser sits.
-/// Unifying them would give one helper two jobs and force VL002's callers to
-/// carry machinery they do not use.
-fn collect_raw_read_locals(block: &syn::Block) -> Vec<String> {
+/// position; VL002 needs text and no position, because a binding holding raw
+/// bytes taints the read wherever the deserialiser sits. Unifying them would
+/// give one helper two jobs and force VL002's callers to carry machinery they
+/// do not use.
+fn collect_let_bindings(block: &syn::Block) -> Vec<LetBinding> {
     let mut out = Vec::new();
-    collect_raw_read_locals_stmts(&block.stmts, &mut out);
+    collect_let_bindings_stmts(&block.stmts, &mut out);
     out
 }
 
-fn collect_raw_read_locals_stmts(stmts: &[syn::Stmt], out: &mut Vec<String>) {
+fn collect_let_bindings_stmts(stmts: &[syn::Stmt], out: &mut Vec<LetBinding>) {
     for stmt in stmts {
         match stmt {
             syn::Stmt::Local(local) => {
                 if let Some(init) = &local.init {
-                    if is_raw_read_text(&normalised(&init.expr)) {
-                        if let syn::Pat::Ident(pat_ident) = unwrap_pat_type(&local.pat) {
-                            out.push(pat_ident.ident.to_string());
-                        }
+                    if let syn::Pat::Ident(pat_ident) = unwrap_pat_type(&local.pat) {
+                        out.push(LetBinding {
+                            name: pat_ident.ident.to_string(),
+                            init: strip_derefs(&normalised(&init.expr)).to_string(),
+                        });
                     }
-                    collect_raw_read_locals_expr(&init.expr, out);
+                    collect_let_bindings_expr(&init.expr, out);
                     if let Some((_, diverge)) = &init.diverge {
-                        collect_raw_read_locals_expr(diverge, out);
+                        collect_let_bindings_expr(diverge, out);
                     }
                 }
             }
-            syn::Stmt::Expr(expr, _) => collect_raw_read_locals_expr(expr, out),
+            syn::Stmt::Expr(expr, _) => collect_let_bindings_expr(expr, out),
             _ => {}
         }
     }
@@ -232,29 +324,43 @@ fn collect_raw_read_locals_stmts(stmts: &[syn::Stmt], out: &mut Vec<String>) {
 
 /// Walks the same block shapes as `RawReadFinder`'s `visit_block`, so that a
 /// deserialiser found inside one of them can still resolve its argument.
-fn collect_raw_read_locals_expr(expr: &syn::Expr, out: &mut Vec<String>) {
+fn collect_let_bindings_expr(expr: &syn::Expr, out: &mut Vec<LetBinding>) {
     match expr {
-        syn::Expr::Block(b) => collect_raw_read_locals_stmts(&b.block.stmts, out),
+        syn::Expr::Block(b) => collect_let_bindings_stmts(&b.block.stmts, out),
         syn::Expr::If(e) => {
-            collect_raw_read_locals_stmts(&e.then_branch.stmts, out);
+            collect_let_bindings_stmts(&e.then_branch.stmts, out);
             if let Some((_, else_expr)) = &e.else_branch {
-                collect_raw_read_locals_expr(else_expr, out);
+                collect_let_bindings_expr(else_expr, out);
             }
         }
         syn::Expr::Match(m) => {
             for arm in &m.arms {
-                collect_raw_read_locals_expr(&arm.body, out);
+                collect_let_bindings_expr(&arm.body, out);
             }
         }
-        syn::Expr::Loop(l) => collect_raw_read_locals_stmts(&l.body.stmts, out),
-        syn::Expr::While(w) => collect_raw_read_locals_stmts(&w.body.stmts, out),
-        syn::Expr::ForLoop(f) => collect_raw_read_locals_stmts(&f.body.stmts, out),
-        syn::Expr::Unsafe(u) => collect_raw_read_locals_stmts(&u.block.stmts, out),
-        syn::Expr::Closure(c) => collect_raw_read_locals_expr(&c.body, out),
-        syn::Expr::Async(a) => collect_raw_read_locals_stmts(&a.block.stmts, out),
-        syn::Expr::TryBlock(t) => collect_raw_read_locals_stmts(&t.block.stmts, out),
+        syn::Expr::Loop(l) => collect_let_bindings_stmts(&l.body.stmts, out),
+        syn::Expr::While(w) => collect_let_bindings_stmts(&w.body.stmts, out),
+        syn::Expr::ForLoop(f) => collect_let_bindings_stmts(&f.body.stmts, out),
+        syn::Expr::Unsafe(u) => collect_let_bindings_stmts(&u.block.stmts, out),
+        syn::Expr::Closure(c) => collect_let_bindings_expr(&c.body, out),
+        syn::Expr::Async(a) => collect_let_bindings_stmts(&a.block.stmts, out),
+        syn::Expr::TryBlock(t) => collect_let_bindings_stmts(&t.block.stmts, out),
         _ => {}
     }
+}
+
+/// Locals holding raw account bytes, each paired with the receivers of the read
+/// that filled it. A name bound more than once contributes one entry per
+/// binding; the resolution here is textual and carries no source position, so
+/// every candidate is kept rather than guessing which one is in scope.
+fn raw_read_locals(bindings: &[LetBinding]) -> Vec<(String, Vec<String>)> {
+    bindings
+        .iter()
+        .filter_map(|binding| {
+            let prefix = raw_read_prefix(&binding.init)?;
+            Some((binding.name.clone(), receivers_of(prefix, bindings)))
+        })
+        .collect()
 }
 
 /// Unwrap `Pat::Type` to get the inner pattern: `let data: Ref<[u8]> = …` has
@@ -269,17 +375,59 @@ fn unwrap_pat_type(pat: &syn::Pat) -> &syn::Pat {
 
 // ─── raw-read finder ─────────────────────────────────────────────────────────
 
+/// One deserialisation of raw account bytes.
+struct RawRead {
+    span: proc_macro2::Span,
+    /// Every candidate text for the account the bytes came from — the receiver
+    /// as written, plus its one-hop alias expansion, plus one entry per
+    /// same-named binding. A silencer fires if *any* candidate is proved,
+    /// because they all name the same read.
+    receivers: Vec<String>,
+}
+
 struct RawReadFinder<'a> {
-    spans: Vec<proc_macro2::Span>,
-    raw_read_locals: &'a [String],
+    reads: Vec<RawRead>,
+    bindings: &'a [LetBinding],
+    raw_read_locals: &'a [(String, Vec<String>)],
 }
 
 impl<'ast> Visit<'ast> for RawReadFinder<'_> {
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-        if is_deserialiser(&node.func) && reads_account_data(&node.args, self.raw_read_locals) {
-            self.spans.push(node.span());
+        if is_deserialiser(&node.func) {
+            let receivers = self.read_receivers(&node.args);
+            if !receivers.is_empty() {
+                self.reads.push(RawRead {
+                    span: node.span(),
+                    receivers,
+                });
+            }
         }
         visit::visit_expr_call(self, node);
+    }
+}
+
+impl RawReadFinder<'_> {
+    /// The accounts whose raw bytes reach this call — empty if none do, which
+    /// is what makes this both the raw-read test and the receiver lookup.
+    fn read_receivers(
+        &self,
+        args: &syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        for arg in args {
+            let text = normalised(arg);
+            if let Some(prefix) = raw_read_prefix(&text) {
+                out.extend(receivers_of(prefix, self.bindings));
+                continue;
+            }
+            let head = leading_ident(&text);
+            for (name, receivers) in self.raw_read_locals {
+                if name == head {
+                    out.extend(receivers.iter().cloned());
+                }
+            }
+        }
+        out
     }
 }
 
@@ -293,28 +441,53 @@ fn is_deserialiser(func: &syn::Expr) -> bool {
         .is_some_and(|segment| DESERIALISERS.contains(&segment.ident.to_string().as_str()))
 }
 
-/// True if any argument is the account's raw bytes — written inline, or read
-/// into a local first and passed by name (`&data`, `&data[8..]`).
-fn reads_account_data(
-    args: &syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>,
-    raw_read_locals: &[String],
-) -> bool {
-    args.iter().any(|arg| {
-        let text = normalised(arg);
-        is_raw_read_text(&text) || {
-            let head = leading_ident(&text);
-            !head.is_empty() && raw_read_locals.iter().any(|name| name == head)
-        }
-    })
+/// The text preceding the first raw-read signal, i.e. the expression the bytes
+/// were borrowed from. `None` when the text does not read account data at all.
+fn raw_read_prefix(text: &str) -> Option<&str> {
+    RAW_READ_SIGNALS
+        .iter()
+        .filter_map(|signal| text.find(signal))
+        .min()
+        .map(|at| &text[..at])
 }
 
-fn is_raw_read_text(text: &str) -> bool {
-    RAW_READ_SIGNALS.iter().any(|signal| text.contains(signal))
+/// Candidate account texts for a raw read whose bytes came from `prefix`: the
+/// receiver as written, plus — when its head names a local that is a plain
+/// alias — that alias expanded once.
+///
+/// Both are kept because the two silencers ask different questions of them. S3
+/// matches the *identifier* against proofs written in the same body, where the
+/// alias name is what appears (`assert_derivation(…, metadata, …)` next to
+/// `let metadata = &self.metadata;`). S4 needs the qualified
+/// `ctx.accounts.<field>` form that only the expansion produces
+/// (`let proposal = &mut ctx.accounts.proposal;`).
+fn receivers_of(prefix: &str, bindings: &[LetBinding]) -> Vec<String> {
+    let base = strip_derefs(prefix);
+    let mut out = vec![base.to_string()];
+    let head = ident_prefix(base);
+    if head.is_empty() {
+        return out;
+    }
+    let suffix = &base[head.len()..];
+    for binding in bindings
+        .iter()
+        .filter(|binding| binding.name == head && is_alias(&binding.init))
+    {
+        out.push(format!("{}{suffix}", binding.init));
+    }
+    out
 }
 
-/// The identifier at the head of a normalised expression, after stripping the
-/// `*`, `&` and `&mut` that an argument is usually wrapped in. `&data[8..]`
-/// yields `data`.
+/// True if an initialiser is a plain path or field access, so that substituting
+/// it for the binding name yields another account expression. An initialiser
+/// containing a call is a *value* — `let metadata = Metadata::deserialize(…)`
+/// re-binds the name to the parsed struct, and expanding through it would swap
+/// the account for its contents.
+fn is_alias(init: &str) -> bool {
+    !init.is_empty() && !init.contains('(')
+}
+
+/// Strips the `*`, `&` and `&mut` an account expression is usually wrapped in.
 ///
 /// `normalised` has already removed the whitespace, so `&mut data` arrives as
 /// `&mutdata` and the `mut` can only be recognised as the borrow's, not the
@@ -322,7 +495,7 @@ fn is_raw_read_text(text: &str) -> bool {
 /// local genuinely named `mutable` would therefore be read as `able` and its
 /// read missed — a false negative, which is the safe direction, and the shape
 /// does not occur in the corpus.
-fn leading_ident(text: &str) -> &str {
+fn strip_derefs(text: &str) -> &str {
     let mut rest = text;
     loop {
         if let Some(stripped) = rest.strip_prefix('*') {
@@ -330,11 +503,138 @@ fn leading_ident(text: &str) -> &str {
         } else if let Some(stripped) = rest.strip_prefix('&') {
             rest = stripped.strip_prefix("mut").unwrap_or(stripped);
         } else {
-            break;
+            return rest;
         }
     }
-    let end = rest.find(|c: char| !is_ident_char(c)).unwrap_or(rest.len());
-    &rest[..end]
+}
+
+/// The leading identifier of `text`, which must already be deref-stripped.
+fn ident_prefix(text: &str) -> &str {
+    let end = text.find(|c: char| !is_ident_char(c)).unwrap_or(text.len());
+    &text[..end]
+}
+
+/// The identifier at the head of a normalised expression, after stripping the
+/// borrow and deref operators. `&data[8..]` yields `data`.
+fn leading_ident(text: &str) -> &str {
+    ident_prefix(strip_derefs(text))
+}
+
+// ─── S3: an address check derived from this program's id ─────────────────────
+
+/// What a body offers as proof that an account sits at an address this program
+/// derived.
+#[derive(Default)]
+struct AddressEvidence {
+    /// A [`PDA_DERIVATIONS`] call appears somewhere in the body.
+    derives: bool,
+    /// Texts in which an account being *checked* would be named: comparisons,
+    /// assertion macros, and the arguments of the derivations themselves.
+    proofs: Vec<String>,
+}
+
+impl AddressEvidence {
+    fn of(block: &syn::Block) -> Self {
+        let mut evidence = Self::default();
+        evidence.visit_block(block);
+        evidence
+    }
+}
+
+impl<'ast> Visit<'ast> for AddressEvidence {
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = &*node.func {
+            if path.path.segments.last().is_some_and(|segment| {
+                PDA_DERIVATIONS.contains(&segment.ident.to_string().as_str())
+            }) {
+                self.derives = true;
+                self.proofs.push(normalised(&node.args));
+            }
+        }
+        visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+        if matches!(node.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_)) {
+            self.proofs.push(normalised(node));
+        }
+        visit::visit_expr_binary(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        let is_check_macro = node.path.segments.last().is_some_and(|segment| {
+            OWNER_CHECK_MACROS.contains(&segment.ident.to_string().as_str())
+        });
+        if is_check_macro {
+            self.proofs.push(normalised(&node.tokens));
+        }
+        visit::visit_macro(self, node);
+    }
+}
+
+/// True when the body both derives a program address **and** names this read's
+/// account in a check.
+///
+/// Both halves are required. Without the second, deriving a PDA for account X
+/// would silence a raw read of an unrelated account Y — "verified something,
+/// therefore verified everything". Ordering is deliberately not required: a
+/// check that follows the read still stops the program acting on bad data, and
+/// demanding order would mean carrying source positions into this rule. The
+/// accepted cost is that a deserialise-then-check body such as
+/// `program-examples/tokens/escrow/native/…/take_offer.rs` goes silent.
+fn pda_address_check_covers(read: &RawRead, evidence: &AddressEvidence) -> bool {
+    evidence.derives
+        && read.receivers.iter().any(|receiver| {
+            let account = ident_prefix(receiver);
+            evidence
+                .proofs
+                .iter()
+                .any(|proof| whole_word_match(proof, account))
+        })
+}
+
+// ─── S4: an Anchor address or seeds constraint ───────────────────────────────
+
+/// True when the field this read names carries a constraint that makes Anchor
+/// verify its address before the body runs.
+///
+/// Only the field actually being read may silence: a struct holding *some*
+/// address-constrained field says nothing about a different field.
+fn anchor_address_constraint_covers(read: &RawRead, accounts: Option<&AccountsStruct>) -> bool {
+    let Some(accounts) = accounts else {
+        return false;
+    };
+    read.receivers.iter().any(|receiver| {
+        field_after_accounts(receiver).is_some_and(|field| is_address_constrained(accounts, field))
+    })
+}
+
+/// `ctx.accounts.proposal` -> `proposal`. `None` when the receiver is not of
+/// that shape, in which case S4 does not apply and the finding stands.
+///
+/// The whole path up to `.accounts.` is required, not just the trailing name:
+/// matching a bare field name would silence an unrelated same-named account,
+/// which is a bug this project has already shipped once.
+fn field_after_accounts(receiver: &str) -> Option<&str> {
+    let at = receiver.find(ACCOUNTS_PATH)? + ACCOUNTS_PATH.len();
+    let field = ident_prefix(&receiver[at..]);
+    (!field.is_empty()).then_some(field)
+}
+
+fn is_address_constrained(accounts: &AccountsStruct, field: &str) -> bool {
+    accounts
+        .fields
+        .iter()
+        .filter(|candidate| candidate.name == field)
+        .any(|candidate| candidate.constraints.iter().any(proves_address))
+}
+
+fn proves_address(constraint: &Constraint) -> bool {
+    match constraint {
+        Constraint::Seeds(_) => true,
+        Constraint::Other(key, _) => key == "address",
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -517,7 +817,7 @@ mod tests {
     /// local first. The finding belongs on the deserialiser, not on the `let`.
     ///
     /// Killing mutation: delete the `raw_read_locals` branch of
-    /// `reads_account_data` (the `leading_ident` lookup).
+    /// `RawReadFinder::read_receivers` (the `leading_ident` lookup).
     #[test]
     fn flags_a_read_through_an_intermediate_local() {
         let findings = findings_for(
@@ -540,9 +840,8 @@ mod tests {
     /// that records every local regardless of what it holds still passes
     /// `flags_a_read_through_an_intermediate_local`.
     ///
-    /// Killing mutation: in `collect_raw_read_locals`, drop the
-    /// `is_raw_read_text(&normalised(&init.expr))` condition and record every
-    /// binding.
+    /// Killing mutation: in `raw_read_locals`, drop the `raw_read_prefix`
+    /// guard and record every binding as holding account data.
     #[test]
     fn the_let_hop_ignores_locals_that_do_not_hold_account_data() {
         let findings = findings_for(
@@ -559,8 +858,172 @@ mod tests {
         assert!(findings.is_empty());
     }
 
+    // ── S3: a PDA address check is an owner check ────────────────────────────
+
+    /// Class B. Only this program can sign for its own PDA, so an account that
+    /// exists at a PDA derived from this program's id and holds data was
+    /// created — and is owned — by this program.
+    ///
+    /// Killing mutation: empty `PDA_DERIVATIONS`, so condition 1 never holds.
+    #[test]
+    fn a_pda_address_check_silences_the_read_it_proves() {
+        let findings = findings_for(
+            r#"
+            pub fn get_pda(program_id: &Pubkey, favorite_account: &AccountInfo, user: &AccountInfo) -> ProgramResult {
+                let (favorite_pda, _bump) =
+                    Pubkey::find_program_address(&[b"favorite", user.key.as_ref()], program_id);
+                if favorite_account.key != &favorite_pda {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+                let favorites = Favorites::try_from_slice(&favorite_account.data.borrow())?;
+                Ok(())
+            }
+        "#,
+            &MissingOwnerCheck,
+        );
+
+        assert!(findings.is_empty());
+    }
+
+    /// S3 must not over-reach across accounts: deriving and checking one
+    /// account's address proves nothing about a *different* account.
+    ///
+    /// Killing mutation: drop condition 2 from `pda_address_check_covers`
+    /// (the receiver-identifier match), leaving only "a derivation exists".
+    #[test]
+    fn a_pda_address_check_does_not_silence_a_different_account() {
+        let findings = findings_for(
+            r#"
+            pub fn get_pda(program_id: &Pubkey, favorite_account: &AccountInfo, other_account: &AccountInfo, user: &AccountInfo) -> ProgramResult {
+                let (favorite_pda, _bump) =
+                    Pubkey::find_program_address(&[b"favorite", user.key.as_ref()], program_id);
+                if favorite_account.key != &favorite_pda {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+                let favorites = Favorites::try_from_slice(&other_account.data.borrow())?;
+                Ok(())
+            }
+        "#,
+            &MissingOwnerCheck,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "VL002");
+        assert_eq!(findings[0].line, 8);
+    }
+
+    /// A comparison against an arbitrary pubkey is not a PDA proof. Without a
+    /// derivation of this program's own address there is nothing that ties the
+    /// account to this program.
+    ///
+    /// Killing mutation: drop condition 1 from `pda_address_check_covers`
+    /// (the `evidence.derives &&`).
+    #[test]
+    fn a_comparison_without_a_derivation_does_not_silence() {
+        let findings = findings_for(
+            r#"
+            pub fn read_config(config_account: &AccountInfo, expected: &Pubkey) -> ProgramResult {
+                if config_account.key != expected {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+                let config = Config::try_from_slice(&config_account.data.borrow())?;
+                Ok(())
+            }
+        "#,
+            &MissingOwnerCheck,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "VL002");
+        assert_eq!(findings[0].line, 6);
+    }
+
+    // ── S4: an Anchor address/seeds constraint is an owner check ─────────────
+
+    /// Class C. Anchor verifies a `seeds`-constrained address before the
+    /// handler body runs; VL002 reads bodies and would never see it.
+    ///
+    /// Killing mutation: delete the `Constraint::Seeds(_)` arm of
+    /// `is_address_constrained`.
+    #[test]
+    fn an_anchor_seeds_constraint_silences_the_read_of_that_field() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct Close<'info> {
+                #[account(mut, seeds = [b"proposal", multisig.key().as_ref()], bump)]
+                pub proposal: UncheckedAccount<'info>,
+            }
+
+            pub fn close(ctx: Context<Close>) -> Result<()> {
+                let proposal_account =
+                    Proposal::try_deserialize(&mut &**ctx.accounts.proposal.data.borrow_mut())?;
+                Ok(())
+            }
+        "#,
+            &MissingOwnerCheck,
+        );
+
+        assert!(findings.is_empty());
+    }
+
+    /// Killing mutation: delete the `Constraint::Other("address", _)` arm of
+    /// `is_address_constrained`.
+    #[test]
+    fn an_anchor_address_constraint_silences_the_read_of_that_field() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct Close<'info> {
+                #[account(address = PYTH_LAZER_STORAGE_ID)]
+                pub proposal: UncheckedAccount<'info>,
+            }
+
+            pub fn close(ctx: Context<Close>) -> Result<()> {
+                let proposal_account =
+                    Proposal::try_deserialize(&mut &**ctx.accounts.proposal.data.borrow_mut())?;
+                Ok(())
+            }
+        "#,
+            &MissingOwnerCheck,
+        );
+
+        assert!(findings.is_empty());
+    }
+
+    /// S4 must not over-reach: a struct having *some* address-constrained
+    /// field says nothing about the field actually being read.
+    ///
+    /// Killing mutation: in `is_address_constrained`, match any field of the
+    /// struct instead of the one the read names.
+    #[test]
+    fn an_anchor_constraint_on_another_field_does_not_silence() {
+        let findings = findings_for(
+            r#"
+            #[derive(Accounts)]
+            pub struct Close<'info> {
+                #[account(address = PYTH_LAZER_STORAGE_ID)]
+                pub storage: UncheckedAccount<'info>,
+                /// CHECK: not validated
+                pub proposal: UncheckedAccount<'info>,
+            }
+
+            pub fn close(ctx: Context<Close>) -> Result<()> {
+                let proposal_account =
+                    Proposal::try_deserialize(&mut &**ctx.accounts.proposal.data.borrow_mut())?;
+                Ok(())
+            }
+        "#,
+            &MissingOwnerCheck,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "VL002");
+        assert_eq!(findings[0].line, 12);
+    }
+
     /// Killing mutation: delete the `syn::Expr::If` arm of
-    /// `collect_raw_read_locals_expr`.
+    /// `collect_let_bindings_expr`.
     #[test]
     fn flags_an_intermediate_local_inside_a_nested_block() {
         let findings = findings_for(

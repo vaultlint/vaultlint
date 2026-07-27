@@ -50,7 +50,7 @@ use syn::visit::{self, Visit};
 
 use crate::anchor::{account_ty, AccountTy};
 use crate::finding::{Finding, Severity};
-use crate::rules::{find_bounded, is_ident_char, normalised, Rule, RuleContext};
+use crate::rules::{is_ident_char, normalised, whole_word_match, Rule, RuleContext};
 use crate::usesite::context_struct_name;
 
 const CPI_CALLS: &[&str] = &["invoke", "invoke_signed"];
@@ -640,18 +640,6 @@ fn is_program_typed_account(text: &str, program_fields: &[String]) -> bool {
     program_fields
         .iter()
         .any(|field| whole_word_match(receiver, field))
-}
-
-/// True if `needle` appears in `haystack` as a complete identifier (not
-/// continued by an identifier character on either side). Returns false
-/// immediately for an empty needle (which would loop forever).
-fn whole_word_match(haystack: &str, needle: &str) -> bool {
-    find_bounded(
-        haystack,
-        needle,
-        |left| !left.chars().next_back().is_some_and(is_ident_char),
-        |right| !right.chars().next().is_some_and(is_ident_char),
-    )
 }
 
 // ─── CPI finder ──────────────────────────────────────────────────────────────

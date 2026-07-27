@@ -183,6 +183,24 @@ pub(crate) fn find_bounded(
     false
 }
 
+/// True if `needle` appears in `haystack` as a complete identifier (not
+/// continued by an identifier character on either side). Returns false
+/// immediately for an empty needle (which would loop forever) — see
+/// [`find_bounded`].
+///
+/// A dotted needle works too, because `is_ident_char` is false for `.`:
+/// `ctx.accounts.token_program` matches inside
+/// `ctx.accounts.token_program.key()` but not inside
+/// `ctx.accounts.token_program_2`.
+pub(crate) fn whole_word_match(haystack: &str, needle: &str) -> bool {
+    find_bounded(
+        haystack,
+        needle,
+        |left| !left.chars().next_back().is_some_and(is_ident_char),
+        |right| !right.chars().next().is_some_and(is_ident_char),
+    )
+}
+
 pub fn all() -> Vec<Box<dyn Rule>> {
     vec![
         Box::new(owner::MissingOwnerCheck),
