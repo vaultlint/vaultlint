@@ -520,6 +520,57 @@ fn leading_ident(text: &str) -> &str {
     ident_prefix(strip_derefs(text))
 }
 
+/// The last dot-separated component of `receiver` that is a plain identifier,
+/// skipping components that end with a call (i.e. contain `(`).
+///
+/// This is needed by S3 so that an Anchor receiver such as
+/// `ctx.accounts.collection_metadata` is matched by its trailing field name
+/// (`collection_metadata`) rather than by its leading identifier (`ctx`).
+/// Matching `ctx` would degenerate to "the body contains any comparison
+/// mentioning `ctx`", which is almost always true and allows a check of an
+/// unrelated account to silence the read.
+///
+/// Examples (receiver → result):
+/// * `ctx.accounts.collection_metadata` → `collection_metadata`
+/// * `favorite_account`                 → `favorite_account`
+/// * `self.metadata`                    → `metadata`
+/// * `source_account.to_account_info()` → `source_account` (call skipped)
+fn trailing_ident(receiver: &str) -> &str {
+    // Walk dot-separated segments from the right, skipping call components.
+    let base = strip_derefs(receiver);
+    let mut rest = base;
+    loop {
+        // Find the last dot.
+        match rest.rfind('.') {
+            None => {
+                // Single segment — return it if it's a plain identifier.
+                let ident = ident_prefix(rest);
+                return if ident.is_empty() {
+                    ident_prefix(base)
+                } else {
+                    ident
+                };
+            }
+            Some(dot) => {
+                let after_dot = &rest[dot + 1..];
+                // If the segment after the dot contains `(`, it is a call;
+                // skip it and look at the part before the dot.
+                if after_dot.contains('(') {
+                    rest = &rest[..dot];
+                } else {
+                    // Plain identifier segment — return it.
+                    let ident = ident_prefix(after_dot);
+                    return if ident.is_empty() {
+                        ident_prefix(base)
+                    } else {
+                        ident
+                    };
+                }
+            }
+        }
+    }
+}
+
 // ─── S3: an address check derived from this program's id ─────────────────────
 
 /// What a body offers as proof that an account sits at an address this program
@@ -562,11 +613,22 @@ impl<'ast> Visit<'ast> for AddressEvidence {
     }
 
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        let tokens = normalised(&node.tokens);
         let is_check_macro = node.path.segments.last().is_some_and(|segment| {
             OWNER_CHECK_MACROS.contains(&segment.ident.to_string().as_str())
         });
+        // OWNER_CHECK_MACROS arm: `require_keys_eq!(a, b)` contains no `==`
+        // and would be lost without this unconditional push.
         if is_check_macro {
-            self.proofs.push(normalised(&node.tokens));
+            self.proofs.push(tokens.clone());
+        }
+        // Comparison arm: `assert!(pda == account.key)` is not in
+        // OWNER_CHECK_MACROS, but its tokens contain `==` and constitute a
+        // proof. Gate on the comparison operator so that a bare logging macro
+        // such as `msg!("{}", account.key)` (which names the account but proves
+        // nothing) does not become a silencer.
+        if !is_check_macro && (tokens.contains("==") || tokens.contains("!=")) {
+            self.proofs.push(tokens);
         }
         visit::visit_macro(self, node);
     }
@@ -585,7 +647,15 @@ impl<'ast> Visit<'ast> for AddressEvidence {
 fn pda_address_check_covers(read: &RawRead, evidence: &AddressEvidence) -> bool {
     evidence.derives
         && read.receivers.iter().any(|receiver| {
-            let account = ident_prefix(receiver);
+            // Use the trailing path segment so that an Anchor receiver such as
+            // `ctx.accounts.collection_metadata` is tied to the account it
+            // actually names rather than to the shared `ctx` prefix. If the
+            // leading identifier were used, condition 2 would degenerate to
+            // "the body contains any comparison mentioning `ctx`", which is
+            // almost always true and allowed a check of an unrelated account
+            // to silence the read (the class-A false-negative described in
+            // fix round 1's §4).
+            let account = trailing_ident(receiver);
             evidence
                 .proofs
                 .iter()
@@ -1042,5 +1112,97 @@ mod tests {
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].line, 6);
+    }
+
+    // ── Fix round 2 ──────────────────────────────────────────────────────────
+
+    /// S3 defect: matching the *leading* identifier (`ctx`) lets a comparison
+    /// against a *different* account silence the read. The check must use the
+    /// trailing path segment (`collection_metadata`), which only matches a proof
+    /// that actually names that account.
+    ///
+    /// Verified corpus shape from
+    /// `metaplex candy-machine/…/set_collection_during_mint.rs:116`.
+    ///
+    /// Killing mutation: revert `trailing_ident` back to `ident_prefix` (the
+    /// leading identifier) inside `pda_address_check_covers`.
+    #[test]
+    fn s3_does_not_silence_when_only_a_different_account_is_checked() {
+        let findings = findings_for(
+            r#"
+            pub fn set_collection_during_mint(ctx: Context<SetCollectionDuringMint>) -> Result<()> {
+                // check covers ctx.accounts.metadata, not ctx.accounts.collection_metadata
+                if ctx.accounts.metadata.data_len() == 0 {
+                    return err!(ErrorCode::MetadataEmpty);
+                }
+                assert_derivation(
+                    ctx.program_id,
+                    &ctx.accounts.collection_pda.to_account_info(),
+                    &[CollectionPDA::PREFIX, ctx.accounts.candy_machine.key().as_ref()],
+                )?;
+                // raw read of collection_metadata — no proof covers this account
+                let data = ctx.accounts.collection_metadata.data.borrow();
+                let collection_metadata = Metadata::deserialize(&mut data.as_ref())?;
+                Ok(())
+            }
+        "#,
+            &MissingOwnerCheck,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "VL002");
+    }
+
+    /// S3 must remain silent when `assert!` contains `==` comparing the derived
+    /// PDA to the account key — the shape in the shank-and-solita survivors.
+    ///
+    /// Killing mutation: remove the `==`/`!=` macro arm from
+    /// `AddressEvidence::visit_macro`.
+    #[test]
+    fn assert_with_eq_and_find_program_address_silences() {
+        let findings = findings_for(
+            r#"
+            pub fn pick_up_car(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+                let rental_order_account = &accounts[0];
+                let user = &accounts[1];
+                let (pda, _) =
+                    Pubkey::find_program_address(&[b"rental", user.key.as_ref()], program_id);
+                assert!(pda == *rental_order_account.key);
+                let rental_order =
+                    RentalOrder::try_from_slice(&rental_order_account.data.borrow())?;
+                Ok(())
+            }
+        "#,
+            &MissingOwnerCheck,
+        );
+
+        assert!(findings.is_empty());
+    }
+
+    /// A bare `msg!` that names an account does not prove its address, so it
+    /// must not silence. This guards the guard: without this test, pushing every
+    /// macro's tokens unconditionally would make `msg!` a silencer.
+    ///
+    /// Killing mutation: in `AddressEvidence::visit_macro`, push tokens for
+    /// every macro unconditionally rather than gating on `==`/`!=`.
+    #[test]
+    fn msg_macro_naming_account_does_not_silence() {
+        let findings = findings_for(
+            r#"
+            pub fn pick_up_car(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+                let favorite_account = &accounts[0];
+                let user = &accounts[1];
+                let (pda, _) =
+                    Pubkey::find_program_address(&[b"favorite", user.key.as_ref()], program_id);
+                msg!("{}", favorite_account.key);
+                let favorites = Favorites::try_from_slice(&favorite_account.data.borrow())?;
+                Ok(())
+            }
+        "#,
+            &MissingOwnerCheck,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "VL002");
     }
 }

@@ -544,3 +544,115 @@ silencer reached into the two classes that were explicitly out of scope.
 5. **Ordering is not checked**, by design. `take_offer.rs:49` is the named example and it
    is now silent. If a body ever checks an address only on a path the read cannot reach,
    this rule will not notice.
+
+---
+
+# Task R4b — fix round 2: report
+
+Status: **DONE**.
+
+VL002 across the twelve trees: **32 → 31**. VL001 4, VL003 579, VL004 66, VL005 21 — all
+unchanged.
+
+---
+
+## 1. What changed
+
+`src/rules/owner.rs` only. No other rule touched, no scanning or file selection touched,
+version still `0.1.0`.
+
+### Fix 1 — S3 receiver match uses trailing path segment
+
+`pda_address_check_covers` previously called `ident_prefix(receiver)` to extract the
+account name from the read's receiver string, yielding `ctx` for every Anchor expression
+of the shape `ctx.accounts.X`. Condition 2 then degenerated to "the body contains any
+comparison mentioning `ctx`", which is almost always true and allowed a check of
+`ctx.accounts.metadata` to silence a raw read of `ctx.accounts.collection_metadata`.
+
+The fix introduces `trailing_ident(receiver)` — a helper that walks dot-separated
+segments from the right and returns the last one that is a plain identifier (skipping
+call components such as `.to_account_info()`). For `ctx.accounts.collection_metadata`
+this yields `collection_metadata`; for `favorite_account` it yields `favorite_account`
+unchanged; for `source_account.to_account_info()` it yields `source_account`. S4 is
+unaffected: `anchor_address_constraint_covers` uses `field_after_accounts`, which already
+matched the qualified form.
+
+### Fix 2 — `assert!` with `==`/`!=` is visible to S3
+
+`AddressEvidence::visit_macro` now has a second arm: when the macro is not in
+`OWNER_CHECK_MACROS` but its token text contains `==` or `!=`, the tokens are pushed to
+`proofs`. This makes `assert!(pda == rental_order_account.key)` — the shape in both
+shank-and-solita survivors — a valid proof.
+
+The gate is `!is_check_macro && (tokens.contains("==") || tokens.contains("!="))` — not
+"any macro" — so `msg!("{}", account.key)` (which names the account but proves nothing)
+does not silence. The `OWNER_CHECK_MACROS` arm remains unconditional alongside it:
+`require_keys_eq!(a, b)` contains no `==` and would be lost without it.
+
+---
+
+## 2. Tests
+
+Three tests added (tests 1, 3, 4 in the findings file; test 2 is the existing S3 silent
+tests, which pass unchanged):
+
+| # | test | killing mutation | result |
+|---|---|---|---|
+| 1 | `s3_does_not_silence_when_only_a_different_account_is_checked` | `trailing_ident` → `ident_prefix` in `pda_address_check_covers` | FAILED (only it) |
+| 3 | `assert_with_eq_and_find_program_address_silences` | delete `==`/`!=` macro arm from `AddressEvidence::visit_macro` | FAILED (only it) |
+| 4 | `msg_macro_naming_account_does_not_silence` | remove `!is_check_macro &&` gate (push every macro unconditionally) | FAILED (only it) |
+
+Every mutation was applied and run; the file was restored after each. Existing tests pass
+unchanged.
+
+`cargo fmt`, `cargo clippy --all-targets -- -D warnings` clean. `cargo test` green:
+**166 lib + 4 integration, 0 failed**.
+
+---
+
+## 3. Measurement
+
+| tree | VL002 round 1 | VL002 round 2 |
+|---|---|---|
+| /tmp/anchor-check | 2 | 2 |
+| /tmp/vl-wide/program-examples | 8 | 6 |
+| /tmp/vl-wide/metaplex-program-library | 8 | 9 |
+| /tmp/vl-wide/mango-v4 | 1 | 1 |
+| /tmp/vl-wide/helium-program-library | 1 | 1 |
+| /tmp/vl-wide/jito-programs | 0 | 0 |
+| /tmp/vl-wide/v4 | 0 | 0 |
+| /tmp/vl-real/protocol-v2 | 4 | 4 |
+| /tmp/vl-real/marginfi-v2 | 8 | 8 |
+| /tmp/vl-real/openbook-v2 | 0 | 0 |
+| /tmp/vl-real/squads-mpl | 0 | 0 |
+| /tmp/vl-real/liquid-staking-program | 0 | 0 |
+| **total** | **32** | **31** |
+
+Movement:
+
+* **`set_collection_during_mint.rs:116` returned (+1)** — Fix 1 means `collection_metadata`
+  is now matched against proofs; nothing in the body proves `collection_metadata`, so the
+  finding fires. The body's `ctx.accounts.metadata.data_len() == 0` check is now correctly
+  scoped to `metadata`, not to `ctx`.
+* **`pick_up_car.rs:37` and `return_car.rs:37` silenced (−2)** — Fix 2 makes
+  `assert!(pda == *rental_order_account.key)` a proof. Both bodies call
+  `find_program_address` and compare its result with the account key inside `assert!`;
+  both are now silent.
+
+Final class composition: **A 17, B 1 (hydra), C 0, D 8, E 5**.
+
+VL001 4, VL003 579, VL004 66, VL005 21 — no movement.
+
+---
+
+## 4. Accepted as written
+
+* **Hydra survivor.** `metaplex hydra/src/utils/mod.rs:77` passes `account_info` (a
+  `to_account_info()` local) to `assert_derivation` while the read names `fanout_for_mint`.
+  Resolving that needs alias expansion on the proof side (different mechanism from the
+  receiver-side expansion), for one finding. Not worth the surface area. Known miss.
+* **Position-blind alias resolution.** Documented at `receivers_of`. A later `let`
+  re-aliasing a name used by an earlier read is in the silencer direction; no position
+  tracking is warranted for a shape absent from the corpus.
+* **`&mut data` → `&mutdata` positional strip.** Known false negative, safe direction,
+  documented at `strip_derefs`.
