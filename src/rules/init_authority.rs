@@ -49,6 +49,59 @@ fn is_authority_named(name: &str) -> bool {
     MARKERS.iter().any(|marker| matches_marker(name, marker))
 }
 
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Scans `text` for occurrences of `needle`, returning true at the first one
+/// whose neighbours are accepted by both predicates. `left` receives everything
+/// before the match and `right` everything after it, so a predicate that needs
+/// more than one character of context can ask for it.
+///
+/// Shared by the two scanners below because the *walk* is the delicate part —
+/// their boundary rules differ, and deliberately so. Two points of care:
+///
+/// * A failed match resumes at `at + needle.len()`, never `at + 1`. Rust
+///   identifiers may hold any XID character, so `pub émetteur_authority:
+///   UncheckedAccount<'info>` is legal input, and resuming one byte into a
+///   multi-byte character panics on the next slice — unacceptable in a linter,
+///   which must survive every file it is pointed at. Skipping the whole needle
+///   loses nothing: a later match starting *inside* this one has a character of
+///   the needle to its left, and every needle used here begins with an
+///   identifier character, so such a match would fail `left` anyway.
+/// * Both predicates look at characters, never bytes. `text.as_bytes()[i] as
+///   char` would read the second byte of `é` as `©` and answer that an
+///   identifier does not continue there.
+fn find_bounded(
+    text: &str,
+    needle: &str,
+    left: impl Fn(&str) -> bool,
+    right: impl Fn(&str) -> bool,
+) -> bool {
+    let mut start = 0;
+    while let Some(offset) = text[start..].find(needle) {
+        let at = start + offset;
+        let end = at + needle.len();
+        if left(&text[..at]) && right(&text[end..]) {
+            return true;
+        }
+        start = end;
+        if start >= text.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// True if no identifier continues into the match from the left, and the match
+/// is not the member of a field access. `vault.authority` reads the *vault's*
+/// stored pubkey; it says nothing about the `authority` account we were handed,
+/// so it must not stand in for a reference to it. (`.` on the **right** is fine
+/// and common: `authority.key()` really is a use of our field.)
+fn no_identifier_or_member_before(left: &str) -> bool {
+    !matches!(left.chars().next_back(), Some(c) if is_ident_char(c) || c == '.')
+}
+
 /// Returns true if `field_name` appears in `constraint_text` as a reference to
 /// the field itself — a bare identifier, not part of a longer name, not the
 /// member of a field access, and not a segment of a path.
@@ -57,46 +110,23 @@ fn is_authority_named(name: &str) -> bool {
 ///
 /// * alphanumeric / `_` on either side — `authority` must not match inside
 ///   `authority_bump` or `pool_authority`.
-/// * `.` on the **left** — `vault.authority` reads the *vault's* stored pubkey.
-///   It says nothing about the `authority` account we were handed, so it must
-///   not stand in for a reference to it. (`.` on the **right** is fine and
-///   common: `authority.key()` really is a use of our field.)  Anchor expands
+/// * `.` on the **left** — see `no_identifier_or_member_before`. Anchor expands
 ///   `#[account(...)]` expressions where the struct's fields are bare locals, so
 ///   neither `self.authority` nor `ctx.accounts.authority` is valid syntax
 ///   there — excluding a `.`-prefixed match therefore loses no real reference.
 /// * `:` on **either** side — `config::authority::ID` is a module path whose
 ///   segment happens to share the name; a field can neither be reached through
-///   `::` nor have items hung off it.
+///   `::` nor have items hung off it. This text is a constraint *attribute*, in
+///   which a lone `:` cannot appear, so a single `:` is always half of a `::`
+///   and rejecting it outright is exact. (Body text is different — see
+///   `contains_access`.)
 fn name_in_seeds(field_name: &str, constraint_text: &str) -> bool {
-    let bytes = constraint_text.as_bytes();
-    let n = field_name.len();
-    let text = constraint_text;
-
-    let mut start = 0;
-    while let Some(pos) = text[start..].find(field_name) {
-        let abs = start + pos;
-        // Check left boundary: must be start of string, or a character that can
-        // neither continue an identifier (`a-z`, `_`) nor introduce one as a
-        // member (`.`) or a path segment (`:`).
-        let left_ok = abs == 0 || {
-            let c = text.as_bytes()[abs - 1] as char;
-            !c.is_alphanumeric() && c != '_' && c != '.' && c != ':'
-        };
-        // Check right boundary: must be end of string or a non-identifier char.
-        // `:` is excluded as well, so `authority::ID` is read as a path.
-        let right_ok = abs + n >= bytes.len() || {
-            let c = bytes[abs + n] as char;
-            !c.is_alphanumeric() && c != '_' && c != ':'
-        };
-        if left_ok && right_ok {
-            return true;
-        }
-        start = abs + 1;
-        if start >= text.len() {
-            break;
-        }
-    }
-    false
+    find_bounded(
+        constraint_text,
+        field_name,
+        |left| no_identifier_or_member_before(left) && !left.ends_with(':'),
+        |right| !matches!(right.chars().next(), Some(c) if is_ident_char(c) || c == ':'),
+    )
 }
 
 fn carries_init(field: &AccountField) -> bool {
@@ -185,13 +215,17 @@ impl LinkedBody {
     /// search that only knows the qualified spelling misses the very shape this
     /// rule exists for.
     ///
-    /// Accepting the bare name is safe because the searches it feeds are
-    /// "was the field actually used / actually checked" filters, not the
-    /// discriminator. The discriminating work is done by T1–T4, which almost
-    /// nothing reaches. Where the looseness could cost something — S4 and the
-    /// forwarding hop, which *silence* findings — it errs towards silence on
-    /// code that does check, which is the direction we want. The
-    /// whole-identifier boundary in `contains_access` still applies, so
+    /// The bare name can also match an unrelated local — nothing here proves the
+    /// local came from this field — and that cuts both ways. Through T5 it can
+    /// raise a finding on a handler that never touched the field; through S4 and
+    /// the forwarding hop it can *silence* a real one, because
+    /// `let authority = &ctx.accounts.other; require!(authority.is_signer)`
+    /// reads as a check on our field. The second is a false negative, which in a
+    /// security linter is the worse of the two — this is a trade, not a safe
+    /// direction. It is accepted because T1–T4 do the discriminating work and
+    /// almost nothing reaches these searches: measured across seven production
+    /// trees the bare spelling changed exactly one finding, the intended one.
+    /// The whole-identifier boundary in `contains_access` still applies, so
     /// `vault.authority.key()` is not a reference to our `authority`.
     fn spellings(&self, field: &str) -> [String; 2] {
         [self.base(field), field.to_string()]
@@ -247,34 +281,30 @@ fn render(tokens: TokenStream, out: &mut String) {
 }
 
 fn is_word(c: Option<char>) -> bool {
-    c.is_some_and(|c| c.is_alphanumeric() || c == '_')
+    c.is_some_and(is_ident_char)
 }
 
 /// Returns true if `needle` occurs in `haystack` as a complete expression: it
 /// may not continue an identifier on either side, hang off a longer receiver
 /// (`other.ctx.accounts.x` is not `ctx.accounts.x`) or be a path segment.
+///
+/// This scans *body* text, where — unlike a constraint attribute — a lone `:` is
+/// the field separator of a struct literal and therefore introduces an
+/// expression rather than continuing a path. Only `::` separates path segments.
+/// Rejecting a single `:` here would blind the rule to
+/// `set_inner(Record { authority: ctx.accounts.authority.key() })`, which is one
+/// of the two canonical ways a handler writes a designated authority into
+/// freshly `init`ed state — the exact write this rule exists to find.
 fn contains_access(haystack: &str, needle: &str) -> bool {
-    let mut start = 0;
-    while let Some(offset) = haystack[start..].find(needle) {
-        let at = start + offset;
-        let left_ok = at == 0 || {
-            let c = haystack.as_bytes()[at - 1] as char;
-            !c.is_alphanumeric() && c != '_' && c != '.' && c != ':'
-        };
-        let end = at + needle.len();
-        let right_ok = end >= haystack.len() || {
-            let c = haystack.as_bytes()[end] as char;
-            !c.is_alphanumeric() && c != '_'
-        };
-        if left_ok && right_ok {
-            return true;
-        }
-        start = at + 1;
-        if start >= haystack.len() {
-            break;
-        }
-    }
-    false
+    find_bounded(
+        haystack,
+        needle,
+        |left| {
+            no_identifier_or_member_before(left)
+                && !left.strip_suffix(':').is_some_and(|l| l.ends_with(':'))
+        },
+        |right| !matches!(right.chars().next(), Some(c) if is_ident_char(c)),
+    )
 }
 
 /// True if `text` reads `<base>.<member>`, directly or through
@@ -733,6 +763,63 @@ pub fn log_message(ctx: Context<LogMessage>) -> Result<()> {
         assert!(one_file(&source).is_empty(), "{:?}", one_file(&source));
     }
 
+    // 10b ── S1's other arms ─────────────────────────────────────────────────
+    //
+    // One test per arm of `own_constraints_validate`, because each arm is a
+    // separate claim about what counts as the field pinning itself down.
+
+    /// `seeds` on the field itself makes Anchor derive and check the address.
+    #[test]
+    fn own_seeds_silence_the_finding() {
+        let source = format!(
+            "{}{}",
+            decl(
+                AUTHORITY_SEED,
+                "    /// CHECK: a PDA of this program\n    \
+                 #[account(seeds = [b\"authority\"], bump)]\n    \
+                 pub authority: UncheckedAccount<'info>,",
+                ""
+            ),
+            HANDLER
+        );
+
+        assert!(one_file(&source).is_empty(), "{:?}", one_file(&source));
+    }
+
+    #[test]
+    fn an_own_signer_constraint_silences_the_finding() {
+        let source = format!(
+            "{}{}",
+            decl(
+                AUTHORITY_SEED,
+                "    /// CHECK: must sign\n    \
+                 #[account(signer)]\n    \
+                 pub authority: UncheckedAccount<'info>,",
+                ""
+            ),
+            HANDLER
+        );
+
+        assert!(one_file(&source).is_empty(), "{:?}", one_file(&source));
+    }
+
+    #[test]
+    fn an_own_address_constraint_silences_the_finding() {
+        let source = format!(
+            "{}{}",
+            decl(
+                AUTHORITY_SEED,
+                "    /// CHECK: pinned to a known key\n    \
+                 #[account(address = crate::ID)]\n    \
+                 pub authority: UncheckedAccount<'info>,",
+                ""
+            ),
+            HANDLER
+        );
+
+        assert!(one_file(&source).is_empty(), "{:?}", one_file(&source));
+    }
+
     // 11 ── S2 ───────────────────────────────────────────────────────────────
 
     #[test]
@@ -785,6 +872,27 @@ pub fn log_message(ctx: Context<LogMessage>) -> Result<()> {
                 UNCHECKED_AUTHORITY,
                 "    #[account(constraint = is_signer_authorized(&a, g.admin, authority.key(), \
                  false, false))]\n    pub state: Account<'info, State>,\n"
+            ),
+            HANDLER
+        );
+
+        assert!(one_file(&source).is_empty(), "{:?}", one_file(&source));
+    }
+
+    // 13b ── S2, namespaced form ─────────────────────────────────────────────
+
+    /// A settled SPL token account whose `authority` is this field was created —
+    /// and its authority set — by an earlier, signed instruction, so the same
+    /// reasoning as `has_one` applies.
+    #[test]
+    fn a_namespaced_constraint_on_a_settled_sibling_silences_the_finding() {
+        let source = format!(
+            "{}{}",
+            decl(
+                AUTHORITY_SEED,
+                UNCHECKED_AUTHORITY,
+                "    #[account(token::authority = authority)]\n    \
+                 pub vault: Account<'info, TokenAccount>,\n"
             ),
             HANDLER
         );
@@ -1041,6 +1149,53 @@ pub fn initialize_account_pda(ctx: Context<MarginfiAccountInitializePda>) -> Res
         assert!(one_file(&source).is_empty(), "{:?}", one_file(&source));
     }
 
+    // ── the field written through a struct literal ──────────────────────────
+    //
+    // `set_inner(T { authority: … })` is one of the two canonical ways an Anchor
+    // handler writes a designated authority into freshly `init`ed state (the
+    // other is field-by-field assignment). Rendered by `body_text` the read is
+    // preceded by the struct literal's `:`, which is *not* a path separator —
+    // and the pair below is what keeps T5 and S4 seeing it symmetrically.
+
+    #[test]
+    fn a_struct_literal_write_is_still_a_read_of_the_field() {
+        let source = format!(
+            "{}{}",
+            marginfi(),
+            r#"
+pub fn initialize_account_pda(ctx: Context<MarginfiAccountInitializePda>) -> Result<()> {
+    ctx.accounts.marginfi_account.set_inner(MarginfiAccount {
+        authority: ctx.accounts.authority.key(),
+        ..Default::default()
+    });
+    Ok(())
+}
+"#
+        );
+
+        assert_flags_authority(&source, &one_file(&source));
+    }
+
+    #[test]
+    fn an_is_signer_check_beside_a_struct_literal_write_silences_the_finding() {
+        let source = format!(
+            "{}{}",
+            marginfi(),
+            r#"
+pub fn initialize_account_pda(ctx: Context<MarginfiAccountInitializePda>) -> Result<()> {
+    require!(ctx.accounts.authority.is_signer, MarginfiError::Unauthorized);
+    ctx.accounts.marginfi_account.set_inner(MarginfiAccount {
+        authority: ctx.accounts.authority.key(),
+        ..Default::default()
+    });
+    Ok(())
+}
+"#
+        );
+
+        assert!(one_file(&source).is_empty(), "{:?}", one_file(&source));
+    }
+
     /// The bare spelling keeps the whole-identifier boundary: reading the key
     /// *stored inside another account* is not a read of the account we were
     /// handed, so T5 stays unsatisfied.
@@ -1146,6 +1301,62 @@ pub fn create(ctx: Context<Create>) -> Result<()> {
         assert!(reads(&text, "authority", "is_signer"));
     }
 
+    // ── non-ASCII identifiers ───────────────────────────────────────────────
+
+    /// Rust identifiers may hold any XID character, and a linter must not abort
+    /// the whole scan on a source file it was asked to read. Both scanners here
+    /// walk past a match that fails its boundary test; resuming one *byte* later
+    /// lands inside `é` and panics on the next slice.
+    #[test]
+    fn a_non_ascii_field_name_is_scanned_without_panicking() {
+        let source = r#"
+#[derive(Accounts)]
+pub struct Create<'info> {
+    #[account(
+        init,
+        payer = fee_payer,
+        space = 64,
+        seeds = [vault.émetteur_authority.key().as_ref(), émetteur_authority.key().as_ref()],
+        bump
+    )]
+    pub record: Account<'info, Record>,
+    pub vault: Account<'info, Vault>,
+    /// CHECK: unvalidated
+    pub émetteur_authority: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub fee_payer: Signer<'info>,
+}
+
+pub fn create(ctx: Context<Create>) -> Result<()> {
+    let Create { émetteur_authority, record, vault, .. } = ctx.accounts;
+    let stored = vault.émetteur_authority.key();
+    record.owner = émetteur_authority.key();
+    Ok(())
+}
+"#;
+
+        let findings = one_file(source);
+
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].line, line_of(source, "pub émetteur_authority:"));
+    }
+
+    /// A multi-byte left neighbour is a left neighbour. Reading one byte and
+    /// casting it turns the `é` of `caféauthority` into `©`, which is not an
+    /// identifier character, and the match would be wrongly accepted as a
+    /// reference to a field named `authority`.
+    #[test]
+    fn a_multi_byte_left_neighbour_still_continues_an_identifier() {
+        assert!(!name_in_seeds(
+            "authority",
+            "[caféauthority.key().as_ref()]"
+        ));
+        assert!(!contains_access(
+            "let k=caféauthority.key();",
+            "authority.key()"
+        ));
+    }
+
     #[test]
     fn a_longer_receiver_is_not_the_account_we_are_tracking() {
         assert!(!contains_access(
@@ -1155,6 +1366,26 @@ pub fn create(ctx: Context<Create>) -> Result<()> {
         assert!(contains_access(
             "let k=ctx.accounts.authority.key();",
             "ctx.accounts.authority.key()"
+        ));
+    }
+
+    /// In *body* text a single `:` is a struct-literal field separator, so it
+    /// introduces an expression rather than continuing a path. Only `::` is a
+    /// path separator. (`name_in_seeds` reads attribute text, where a lone `:`
+    /// cannot occur, and rejects both.)
+    #[test]
+    fn a_struct_literal_separator_is_not_a_path_separator() {
+        assert!(contains_access(
+            "Record{authority:ctx.accounts.authority.key()}",
+            "ctx.accounts.authority.key()"
+        ));
+        assert!(!contains_access(
+            "let k=other::authority.key();",
+            "authority.key()"
+        ));
+        assert!(!name_in_seeds(
+            "authority",
+            "[config::authority::ID.as_ref()]"
         ));
     }
 }
