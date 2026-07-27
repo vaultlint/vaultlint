@@ -478,3 +478,261 @@ No remaining false-positive class found. The controller's calibration cases (mar
 - `cargo fmt --check`: clean
 - `cargo clippy --all-targets -- -D warnings`: clean
 - `cargo test`: 143 lib + 4 integration, all green
+
+---
+
+# Task R4a — Fix Round 3 (final)
+
+## Commits
+
+`d814eb0` — fix(VL005): fix round 3 — position-aware let resolution, qualified S2 paths
+
+## Test Results
+
+149 lib tests + 4 integration tests — all green (was 143 lib). Six tests added,
+one rewritten, one given a real subject. `cargo fmt --check` and
+`cargo clippy --all-targets -- -D warnings` clean.
+
+---
+
+## What Was Done
+
+### Important 1 (B2) — position-aware `let` resolution
+
+`LetBinding` now carries `pos: (usize, usize)`, taken from `local.span().start()`
+via `proc-macro2`'s `span-locations` feature. `collect_let_bindings_stmts` no
+longer overwrites on a name collision — it pushes **every** binding, repeats
+included. Selection moved to a new `nearest_preceding(bindings, name, at)`,
+which filters `b.name == name && b.pos < at` and takes `max_by_key(|b| b.pos)`.
+
+Both `resolve_one_hop` and `resolve_program_id_text` take the position of the
+`invoke` (`pos_of(call_span)`, computed once per call in `check_body`). Using
+the invoke position for the program-id text as well as for the first argument is
+sound: any binding the built `Instruction` refers to must already precede the
+`invoke` for the code to compile.
+
+Neither first-wins nor last-wins was right; both describe one fixed state of the
+world and apply it to every call in the body. The sibling-branch shape falls out
+of "strictly less than" for free: a binding in the arm that does not contain the
+call is either after it (excluded) or before it but outranked by the binding in
+the call's own arm.
+
+The round-1 shadowing test `shadowed_binding_resolves_to_latest_value` passes
+unchanged. Its **doc comment** was updated — it described the last-wins
+trade-off ("makes the invoke before the shadowing fire, which is a false
+positive... that is the accepted trade") as a live property of the code, and
+that property no longer exists. Test body and assertions are untouched; only the
+prose changed, so it does not contradict the implementation. Its killing
+mutation is now `max_by_key` → `min_by_key`.
+
+### Important 2 (B4) — S2 registers qualified access paths
+
+`context_program_fields` now registers:
+
+- **S2** (`Context<S>` bound as `<binding>`) → `<binding>.accounts.<field>`
+- **S2c** (Accounts-struct parameter bound as `<binding>`) → `<binding>.<field>`
+- **S2b** (parameter *typed* `Program<'info, T>`) → the bare binding, unchanged.
+  There the binding itself is the verified account, not a field of something
+  else, so the bare name is unambiguous.
+
+A new helper `push_program_fields(fields, ctx, struct_name, prefix)` does the
+struct lookup and `Program`-field filtering for both S2 and S2c.
+
+The let-alias argument that motivated bare names in round 2 was re-checked by
+hand against the qualified form, exactly as the findings file asked, and all
+three shapes still silence:
+
+| Shape | Resolved text | Needle | Silenced |
+|---|---|---|---|
+| `let cpi_program = ctx.accounts.auction_house_program.to_account_info();` then `cpi_program.key()` | `ctx.accounts.auction_house_program.to_account_info().key()` | `ctx.accounts.auction_house_program` | yes |
+| `let token_program = &accounts.token_program;` then `transfer(token_program.key, …)` | `accounts.token_program.key` | `accounts.token_program` | yes |
+| `let accounts = &ctx.accounts;` then `accounts.token_program.key()` | `ctx.accounts.token_program.key()` | `ctx.accounts.token_program` | yes |
+
+Every existing S2/S2b/S2c positive test passed untouched, so no real silencer
+was lost and there was nothing to escalate to the controller. The destructuring
+shape (`let Context { accounts, .. } = ctx;`) does stop being registered, but
+`collect_let_bindings` never recorded it anyway — it is not a `Pat::Ident` — so
+nothing changed there either. The measurement confirms it: no new survivor.
+
+The doc comment on `context_program_fields` was rewritten. The old one argued
+for bare names; leaving it would have left the comment contradicting the code,
+which is the same class of defect the round-3 findings called out.
+
+### Minor 3 — `Box<Program<'info, T>>`
+
+`src/anchor/mod.rs`'s `account_ty` is now `pub(crate)`. `context_program_fields`
+calls it instead of hand-rolling the final-segment extraction:
+`AccountTy::Program` → S2b, `AccountTy::Other(name)` with a non-empty name →
+S2c struct lookup. The `context_struct_name(ty)` call stays ahead of it. This
+gives `Box`-unwrapping to S2c for free.
+
+### Minor 4 — closures, let-else, try/async
+
+Added `Expr::Closure`, `Expr::Async` and `Expr::TryBlock` arms to
+`collect_let_bindings_expr`, and the `init.diverge` (let-else `else { … }`)
+block to `collect_let_bindings_stmts`.
+
+**One step beyond the literal instruction, stated explicitly for review.** The
+`Expr::Closure` arm alone is nearly inert: `collect_let_bindings_expr` is only
+reached from `Stmt::Expr`, if/else branches and match-arm bodies, so it fires
+for a closure in tail position but *not* for `let send = |…| { … };` — the
+common shape, and the one where `CpiFinder`'s `visit_block` genuinely disagrees
+with the binding walk. I added one line, `collect_let_bindings_expr(&init.expr,
+out)`, so the walk descends into `let` initialisers. Without it the fix would
+have looked done and done nothing, which this project treats as worse than
+leaving it open.
+
+Mutation testing confirms both lines are load-bearing: removing either one on
+its own kills `cpi_inside_a_closure_is_found`. The corpus measurement below is
+byte-identical, so the extra descent moved nothing.
+
+### Minor 5 — `invoke_of_externally_built_instruction_is_not_a_finding`
+
+Subject changed from `build_instruction()` to
+`build_instruction(*target_program.key)`, assertion kept. Verified empirically
+in both directions (see mutation table): with the old no-argument subject the
+test survives deletion of the `PROGRAM_ID_FIRST_BUILDERS` guard; with the new
+one it fails, which is the property it was written to have.
+
+### Collateral: `program_field_name_does_not_match_inside_longer_name` rewritten
+
+Not requested, but required by the project's killability rule. That test proves
+`whole_word_match` is not `contains`. It used a `Program` field named `program`
+and an `AccountInfo` field named `token_program`; with bare needles, `program`
+was a substring of `token_program`, so `contains` silenced and the test died.
+Under Important 2 the needle became `ctx.accounts.program`, which is **not** a
+substring of `ctx.accounts.token_program` — so the test would have kept passing
+with `contains` substituted, i.e. it would have stopped killing its mutation.
+
+The `AccountInfo` field is now `program_2`, making the receiver
+`ctx.accounts.program_2` a strict superstring of the needle
+`ctx.accounts.program`. This is the exact case the findings file cites for the
+dotted needle, and it restores the kill. Verified: substituting `contains` fails
+this test and only this test.
+
+---
+
+## Tests Added / Changed (Round 3)
+
+| Test | Covers | Killed by (verified by running the mutation) |
+|---|---|---|
+| `sequential_shadowing_flags_only_the_later_invoke` | Important 1 | Dropping `b.pos < at` from `nearest_preceding` |
+| `sibling_branches_flag_only_the_dangerous_arm` | Important 1 | Dropping `b.pos < at` from `nearest_preceding` |
+| `s2_field_name_does_not_silence_an_unrelated_raw_parameter` | Important 2 (S2) | Reverting the S2 registration to the bare `field.name` |
+| `s2c_field_name_does_not_silence_an_unrelated_raw_parameter` | Important 2 (S2c) | Reverting the S2c registration to the bare `field.name` |
+| `s2b_boxed_program_typed_parameter_silences_the_finding` | Minor 3 | Reverting S2b to the direct `last_seg.ident == "Program"` comparison |
+| `cpi_inside_a_closure_is_found` | Minor 4 | Removing the `syn::Expr::Closure` arm (also killed by removing the `let`-initialiser descent — either alone suffices) |
+| `shadowed_binding_resolves_to_latest_value` (doc comment only) | Important 1 | `max_by_key` → `min_by_key` in `nearest_preceding` |
+| `invoke_of_externally_built_instruction_is_not_a_finding` (subject) | Minor 5 | Removing the `PROGRAM_ID_FIRST_BUILDERS` guard |
+| `program_field_name_does_not_match_inside_longer_name` (rewritten) | boundary guard | Replacing `whole_word_match(h, n)` with `h.contains(n)` |
+
+Each mutation was applied to the real source, `cargo test --lib cpi` was run,
+and the failing set recorded. In every case the intended test failed. Two
+control results worth recording:
+
+- Under the `PROGRAM_ID_FIRST_BUILDERS` mutation with the **old** no-argument
+  subject, `invoke_of_externally_built_instruction_is_not_a_finding` **passed** —
+  confirming the Minor 5 diagnosis directly rather than by argument.
+- The two Important-1 tests are killed by the position filter but survive the
+  `max_by_key`/`min_by_key` swap distinctly from `shadowed_binding_resolves_to_latest_value`,
+  so the three cover the two directions independently.
+
+---
+
+## Measurement (Round 3)
+
+`cargo build --release`, then `vaultlint scan <tree> --format json --fail-on never`
+over all 12 trees, before (at `b0b5147`) and after (at `d814eb0`).
+
+| Tree | VL001 | VL002 | VL003 | VL004 | VL005 |
+|---|---|---|---|---|---|
+| `/tmp/anchor-check` | 1 | 1 | 64 | 16 | 3 |
+| `/tmp/vl-wide/program-examples` | 0 | 7 | 9 | 8 | 1 |
+| `/tmp/vl-wide/metaplex-program-library` | 1 | 0 | 12 | 25 | 10 |
+| `/tmp/vl-wide/mango-v4` | 0 | 0 | 133 | 1 | 0 |
+| `/tmp/vl-wide/helium-program-library` | 0 | 0 | 27 | 4 | 1 |
+| `/tmp/vl-wide/jito-programs` | 0 | 0 | 0 | 0 | 0 |
+| `/tmp/vl-wide/v4` | 0 | 0 | 0 | 4 | 0 |
+| `/tmp/vl-real/protocol-v2` | 2 | 0 | 181 | 0 | 2 |
+| `/tmp/vl-real/marginfi-v2` | 0 | 0 | 30 | 1 | 4 |
+| `/tmp/vl-real/openbook-v2` | 0 | 0 | 67 | 2 | 0 |
+| `/tmp/vl-real/squads-mpl` | 0 | 0 | 0 | 0 | 0 |
+| `/tmp/vl-real/liquid-staking-program` | 0 | 0 | 56 | 5 | 0 |
+| **Total** | **4** | **8** | **579** | **66** | **21** |
+
+**VL005 total 21, as expected. VL001–VL004 unchanged.**
+
+This table is identical before and after. Rather than compare counts alone I
+diffed the full JSON documents for all 12 trees: every one is **byte-identical**
+between `b0b5147` and `d814eb0`. Nothing moved — not a count, not a line, not a
+message string. The round-2 survivor classification therefore stands unamended.
+
+That is the expected result. None of the four fixes targets a corpus shape:
+sequential shadowing and sibling-branch CPIs do not occur in these trees, no
+function takes both an `Accounts` struct and a same-named raw parameter, no
+`Box<Program<…>>` parameter feeds a CPI program id, and no `invoke` sits inside
+a closure whose `let` bindings matter.
+
+---
+
+## The "Deliberately not changing" list — my verdicts
+
+The findings file asked for an explicit verdict on each, and for disagreement to
+be voiced rather than swallowed. I agree with both, for the stated reasons.
+
+**Empty-needle test kills its mutation by hanging.** Agreed, leave it. The hang
+is only reachable under a deliberate deletion of the `needle.is_empty()` guard
+in `find_bounded`; no input can reach it otherwise. The alternative — a test
+that cannot detect the hang at all — trades a loud, obvious CI failure for a
+silent gap in coverage of a guard that protects against an infinite loop in a
+linter. A hung CI job is diagnosed in minutes. An unguarded infinite loop
+shipped to a user is a tool that never returns. Guard comment left in place.
+
+**`t2_follows_let_hop_with_shorthand_field` overlaps its sibling.** Agreed, keep
+it. Mutation coverage is not the only thing a test buys. Field shorthand
+(`Instruction { program_id, … }`) is a shape a reader would reasonably assume
+the struct-literal branch does not handle, because the member and the expression
+are the same token. The test is the cheapest possible answer to that question.
+Redundant kill coverage is not a cost worth removing it for.
+
+---
+
+## Concerns
+
+1. **The `let`-initialiser descent is one line beyond the written scope.** It is
+   documented above and in a code comment, the measurement shows it changed
+   nothing on the corpus, and it is independently killable. But it is an
+   addition the findings file did not ask for, and the controller should see it
+   as such. If it is unwanted, removing the single
+   `collect_let_bindings_expr(&init.expr, out);` line leaves the rest of Minor 4
+   intact — at the cost of making the `Expr::Closure` arm reachable only for a
+   closure in tail position, and `cpi_inside_a_closure_is_found` would then need
+   rewriting to that shape.
+
+2. **`program_field_name_does_not_match_inside_longer_name` was rewritten**, not
+   just re-commented. The findings file said to stop rather than edit an
+   existing S2 test — but that instruction was about *positive* (silencing)
+   tests, where an edit would mean a real silencer had broken. This is a
+   negative test that keeps passing either way; the edit restores its
+   killability, which the project's own rule requires. Flagging it so the
+   distinction is the controller's to confirm, not mine to assume.
+
+3. **Position resolution is textual, not scope-aware.** `nearest_preceding` picks
+   the last binding textually above the call, which is right for the shapes in
+   the findings but not a real scope analysis. A binding inside a nested block
+   that closes before the `invoke` can still be selected, e.g.
+   `let ix = <evil>; if c { let ix = <safe>; } invoke(&ix);` resolves to the
+   safe inner binding and goes quiet. This is strictly better than the round-1
+   and round-2 behaviour and matches what the findings prescribed; a full scope
+   walk is the next step if this class ever shows up in a corpus. It does not
+   today.
+
+---
+
+## Code Quality
+
+- `cargo fmt --check`: clean
+- `cargo clippy --all-targets -- -D warnings`: clean
+- `cargo test`: 149 lib + 4 integration, all green
+- Version still `0.1.0`; `examples/vulnerable/unchecked_cpi.rs` and
+  `tests/examples.rs` untouched; no new dependencies; not pushed.
