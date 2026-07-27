@@ -349,3 +349,132 @@ All 53 findings verified to have account-derived program ids (`token_program_id.
 - `cargo fmt --check`: clean
 - `cargo clippy --all-targets -- -D warnings`: clean
 - `cargo test`: 137 lib + 4 integration, all green
+
+---
+
+# Task R4a Fix Round 2 — Remediation of Reviewer Findings
+
+## Status: DONE
+
+## Commit
+
+`65b6724` — fix(VL005): fix round 2 — S2b, S2c (Program-param / Accounts-param), S5 (CpiContext)
+
+## Test Results
+
+143 lib tests + 4 integration tests — all green. Added 6 new tests (was 137 lib, now 143).
+
+---
+
+## What Was Done
+
+### S2b — `Program<'info, T>` parameter silencer
+
+The original S2 only checked `Program`-typed fields when they arrived via a `Context<S>` parameter. A function like `bid_logic<'info>(token_program: Program<'info, Token>, …)` receives an already-verified account directly. S2b adds a scan of every typed function parameter: if the parameter's type (after stripping `&` / `&mut` refs and lifetimes) has `Program` as its final path segment, the binding name is added to the verified-fields list.
+
+This silences the `bid_logic` family in metaplex-program-library (2 findings at `bid/mod.rs:689` and `:893`).
+
+### S2c — Accounts-struct-by-reference parameter silencer
+
+The `deposit_logic<'info>(accounts: &mut Deposit<'info>, …)` idiom is `Context<Deposit>` with the wrapper peeled off. S2c checks whether a parameter's type (after stripping refs/lifetimes) names an `Accounts` struct in `ctx.anchor.accounts_structs`. If so, its `Program`-typed field names are recorded the same way S2 original does — as bare field names. `resolve_program_id_text` expands local let-aliases (e.g. `let token_program = &accounts.token_program;` → the program id text resolves to `accounts.token_program.key`), and `whole_word_match` then finds `token_program` as a whole identifier in the receiver portion.
+
+This silences the `deposit_logic` and `withdraw_logic` findings (2 findings at `deposit/mod.rs:293` and `withdraw/mod.rs:314`).
+
+### S5 — `CpiContext` helper silencer
+
+28 of the 53 round-1 survivors were in `anchor-check/spl/src/token_2022_extensions/`. Every one takes `CpiContext<'_, '_, '_, 'info, T>` as a parameter — these are CPI helper functions, not instruction handlers. VL005's audience is the calling handler; flagging these helpers is unactionable.
+
+S5 adds an early-return check in `check_body`: if any typed parameter's type (after stripping refs) has `CpiContext` as its final path segment, the function is a CPI helper and the rule stays silent.
+
+**Exact segment comparison, not suffix**: `context_struct_name` tests `segment.ident != "Context"` as an exact match, so `CpiContext` does not collide with it. S5 similarly tests `last.ident == "CpiContext"` — an exact comparison — so `Context<T>` (last segment `Context`, not `CpiContext`) is never silenced by S5. Test `s5_must_not_silence_plain_context` verifies this directly: the same body with `Context<T>` instead of `CpiContext<…>` fires as expected.
+
+The silencer is documented in the module doc (after the existing `!` doc block) with the reasoning in init_authority house style, explaining why a future reader should not mistake it for an oversight.
+
+### `is_cpi_context_type` and `strip_type_refs` helpers
+
+Two small helpers added:
+- `strip_type_refs(&syn::Type) -> &syn::Type`: peels leading `&` / `&mut` wrappers recursively so that `&CpiContext<…>` and `&mut CpiContext<…>` also match S5.
+- `is_cpi_context_type(&syn::Type) -> bool`: checks for `CpiContext` as the final path segment after stripping refs.
+
+### `context_program_fields` restructured
+
+`context_program_fields_inner` (which returned `Option`) was removed; `context_program_fields` now iterates every typed parameter and handles S2 / S2b / S2c as three branches in one loop. The logic is equivalent to the original S2 for `Context<S>` parameters and extends it for the two new shapes.
+
+---
+
+## Tests Added (Round 2)
+
+| Test | Silencer | Killed by |
+|------|----------|-----------|
+| `s2b_program_typed_parameter_silences_the_finding` | S2b | Removing the `last_seg.ident == "Program"` arm in `context_program_fields` |
+| `s2b_account_info_parameter_is_not_silenced` | S2b negative | Removing the type check (silencing any parameter regardless of type) |
+| `s2c_accounts_struct_parameter_silences_the_finding` | S2c | Removing the Accounts-struct lookup arm in `context_program_fields` |
+| `s2c_account_info_field_is_not_silenced` | S2c negative | Removing the `f.ty == AccountTy::Program` filter |
+| `s5_cpi_context_helper_is_silent` | S5 | Removing the S5 early-return in `check_body` |
+| `s5_must_not_silence_plain_context` | S5 over-reach prevention | Changing `== "CpiContext"` to `ends_with("Context")` (which then silences `Context<T>` too) |
+
+---
+
+## Measurement (Round 2)
+
+### VL005 Before/After per Tree
+
+| Tree | VL005 (round 1) | VL005 (round 2) | Delta |
+|------|-----------------|-----------------|-------|
+| `/tmp/anchor-check` | 31 | 3 | -28 |
+| `/tmp/vl-wide/program-examples` | 1 | 1 | 0 |
+| `/tmp/vl-wide/metaplex-program-library` | 14 | 10 | -4 |
+| `/tmp/vl-wide/mango-v4` | 0 | 0 | 0 |
+| `/tmp/vl-real/protocol-v2` | 2 | 2 | 0 |
+| `/tmp/vl-real/marginfi-v2` | 4 | 4 | 0 |
+| `/tmp/vl-real/openbook-v2` | 0 | 0 | 0 |
+| `/tmp/vl-real/squads-mpl` | 0 | 0 | 0 |
+| `/tmp/vl-real/liquid-staking-program` | 0 | 0 | 0 |
+| `/tmp/vl-wide/helium-program-library` | 1 | 1 | 0 |
+| `/tmp/vl-wide/jito-programs` | 0 | 0 | 0 |
+| `/tmp/vl-wide/v4` | 0 | 0 | 0 |
+| **Total** | **53** | **21** | **-32** |
+
+Findings document predicted "roughly 32 findings to disappear (28 anchor spl + 2 bid_logic + 2 deposit/withdraw_logic)". The actual reduction is 32, which matches exactly.
+
+### VL001–VL004 Unchanged
+
+All VL001–VL004 counts are identical to round 1. No regressions.
+
+### Per-Survivor Classification
+
+All 21 survivors classified. Every one is a **true positive**: the account supplying the program id is declared as a raw `AccountInfo` / `UncheckedAccount` or equivalent untyped account — Anchor has not verified the program id.
+
+| # | File | Line | Program id expression | Account type | TP/FP |
+|---|------|------|----------------------|-------------|-------|
+| 1 | `anchor-check/tests/auction-house/…/utils.rs` | 205 | `token_program.key` | `&AccountInfo<'a>` param | TP |
+| 2 | `anchor-check/tests/auction-house/…/utils.rs` | 348 | `token_program.key` | `&AccountInfo<'a>` param | TP |
+| 3 | `anchor-check/tests/lockup/…/lib.rs` | 479 | `*transfer.whitelisted_program.to_account_info().key` | not `Program<>` typed | TP |
+| 4 | `program-examples/hand/src/lib.rs` | 31 | `*lever_program.key` | `&AccountInfo` (next_account_info) | TP |
+| 5 | `metaplex/auction-house/…/utils.rs` | 284 | `token_program.key` | `&AccountInfo<'a>` param | TP |
+| 6 | `metaplex/auction-house/…/utils.rs` | 446 | `token_program.key` | `&AccountInfo<'a>` param | TP |
+| 7 | `metaplex/candy-machine/…/utils.rs` | 96 | `token_program.key` | `AccountInfo<'a>` field | TP |
+| 8 | `metaplex/candy-machine/…/utils.rs` | 166 | `token_program.key` | `AccountInfo<'a>` field | TP |
+| 9 | `metaplex/core/rust/utils/…/cpi.rs` | 18 | `token_program.key` | `AccountInfo<'a>` field | TP |
+| 10 | `metaplex/core/rust/utils/…/cpi.rs` | 60 | `token_program.key` | `AccountInfo<'a>` field | TP |
+| 11 | `metaplex/core/rust/utils/…/cpi.rs` | 100 | `token_program.key` | `AccountInfo<'a>` field | TP |
+| 12 | `metaplex/core/rust/utils/…/cpi.rs` | 147 | `token_program.key` | `AccountInfo<'a>` field | TP |
+| 13 | `metaplex/core/rust/utils/…/cpi.rs` | 197 | `token_program.key` | `AccountInfo<'a>` field | TP |
+| 14 | `metaplex/token-entangler/…/utils.rs` | 236 | `token_program.key` | `&AccountInfo<'a>` param | TP |
+| 15 | `protocol-v2/…/token.rs` | 274 | `token_program.key` | `&AccountInfo` param | TP |
+| 16 | `protocol-v2/…/serum.rs` | 122 | `*self.serum_program.key` | `&'a AccountInfo<'b>` field | TP |
+| 17 | `marginfi-v2/kamino-mocks/…/lib.rs` | 68 | `*marginfi_program_ai.key` | local `AccountInfo` variable | TP |
+| 18 | `marginfi-v2/…/drift/claim_bad_debt.rs` | 249 | `self.merkle_distributor_program.key()` | `UncheckedAccount<'info>` | TP |
+| 19 | `marginfi-v2/…/handle_bankruptcy.rs` | 81 | `ctx.accounts.marginfi_program.key()` | `UncheckedAccount<'info>` | TP |
+| 20 | `marginfi-v2/…/start_liquidate.rs` | 60 | `ctx.accounts.marginfi_program.key()` | `UncheckedAccount<'info>` | TP |
+| 21 | `helium-program-library/…/execute_transaction_v0.rs` | 166 | `*ctx.remaining_accounts[ix.program_id_indexasusize].key` | dynamically-indexed `remaining_accounts` | TP |
+
+No remaining false-positive class found. The controller's calibration cases (marginfi and drift survivors being `UncheckedAccount` — true positives) match the pattern seen across all 21 survivors.
+
+---
+
+## Code Quality
+
+- `cargo fmt --check`: clean
+- `cargo clippy --all-targets -- -D warnings`: clean
+- `cargo test`: 143 lib + 4 integration, all green
