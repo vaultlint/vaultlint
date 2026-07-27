@@ -23,6 +23,27 @@
 //! `use spl_token::instruction;` has no `spl_token` segment and will not match
 //! `PROGRAM_ID_FIRST_BUILDERS`. That is an accepted missed finding — a false
 //! negative is safer than a false positive.
+//!
+//! ## Silencer S5 — functions taking `CpiContext` are CPI helpers, not handlers
+//!
+//! Anchor uses two distinct context types:
+//!   - `Context<T>` — the type taken by instruction *handlers* (program entry
+//!     points). The handler is responsible for validating every account it uses.
+//!   - `CpiContext<…, T>` — the type taken by CPI *helper* functions. The
+//!     helper's caller supplies the accounts (including the target program); the
+//!     helper cannot verify an id it was handed by design. Responsibility for
+//!     verification sits entirely with the calling handler, which already takes
+//!     `Context<T>` and is where VL005 is applied.
+//!
+//! Every function whose parameter type's final path segment is `CpiContext` is a
+//! CPI helper, not a handler. VL005 stays silent in those bodies.
+//!
+//! `context_struct_name` matches `Context` as the *final* segment, so it does
+//! not collide with `CpiContext` — `CpiContext` ends in `CpiContext`, not
+//! `Context`. An exact segment comparison is used for S5 (`== "CpiContext"`),
+//! not a suffix check, so a type named `MyContext` or `FooContextBar` would not
+//! be silenced. This is verified by test S5-over-reach: the same body with
+//! `Context<T>` instead of `CpiContext<…>` fires.
 
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
@@ -77,6 +98,24 @@ struct FunctionVisitor<'a, 'ctx> {
 
 impl FunctionVisitor<'_, '_> {
     fn check_body(&mut self, sig: &syn::Signature, block: &syn::Block) {
+        // S5 — stay silent when the enclosing function is a CPI helper, not a
+        // handler. CPI helpers take `CpiContext<…>` as a parameter; handlers
+        // take `Context<T>`. The helper cannot verify accounts it was handed
+        // by its caller; VL005 correctly fires on the *calling handler* instead.
+        //
+        // The match is an exact segment comparison (`== "CpiContext"`), not a
+        // suffix or substring check, so `MyContext` or `SomeCpiContextWrapper`
+        // would not be silenced. This is verified by test `s5_must_not_silence_plain_context`.
+        if sig.inputs.iter().any(|arg| {
+            if let syn::FnArg::Typed(t) = arg {
+                is_cpi_context_type(&t.ty)
+            } else {
+                false
+            }
+        }) {
+            return;
+        }
+
         // S1 — fast exit: a verification signal is present anywhere in the body.
         let body_text = normalised(block);
         if VERIFICATION_SIGNALS
@@ -90,7 +129,14 @@ impl FunctionVisitor<'_, '_> {
         let bindings = collect_let_bindings(block);
 
         // S2 setup: find which `Program<…>` fields are in the context struct for
-        // this function, if it takes a `Context<S>`.
+        // this function. This covers three sources:
+        //   - S2  (original): a `Context<S>` parameter → look up the struct.
+        //   - S2b (new): a plain `Program<'info, T>` typed parameter → its name
+        //                is itself a verified field.
+        //   - S2c (new): a `&[mut] S` typed parameter where `S` is an `Accounts`
+        //                struct → treat the binding name as the ctx-equivalent and
+        //                walk S's fields, substituting `<binding>.<field>` for
+        //                `ctx.accounts.<field>`.
         let program_account_fields = context_program_fields(sig, self.ctx);
 
         // Find all `invoke` / `invoke_signed` calls in the body.
@@ -343,46 +389,138 @@ fn instruction_program_id(expr: &syn::Expr) -> Option<&syn::Expr> {
     }
 }
 
-// ─── S2: is the program id supplied by a Program-typed account? ──────────────
+// ─── S5: is this function a CpiContext helper? ───────────────────────────────
 
-/// Returns the names of all `Program<'info, T>` fields in the context struct
-/// for `sig`'s `Context<S>` parameter, looked up in `ctx.anchor`.
-fn context_program_fields(sig: &syn::Signature, ctx: &RuleContext<'_>) -> Vec<String> {
-    context_program_fields_inner(sig, ctx).unwrap_or_default()
+/// Returns true if `ty` is a `CpiContext<…>` type — any path whose final
+/// segment is exactly `CpiContext` (case-sensitive). Strips leading `&` and
+/// `&mut` first so that `&CpiContext<…>` also matches.
+///
+/// **Exact segment comparison only.** A suffix check would silently swallow
+/// `Context<T>` (whose last segment is `Context`, not `CpiContext`) — but the
+/// comparison below compares to `"CpiContext"` so that cannot happen.
+fn is_cpi_context_type(ty: &syn::Type) -> bool {
+    let inner = strip_type_refs(ty);
+    if let syn::Type::Path(path) = inner {
+        if let Some(last) = path.path.segments.last() {
+            return last.ident == "CpiContext";
+        }
+    }
+    false
 }
 
-fn context_program_fields_inner(
-    sig: &syn::Signature,
-    ctx: &RuleContext<'_>,
-) -> Option<Vec<String>> {
-    // Find the first `Context<S>` typed parameter in the function signature.
-    let struct_name = sig
-        .inputs
-        .iter()
-        .filter_map(|arg| {
-            if let syn::FnArg::Typed(t) = arg {
-                context_struct_name(&t.ty)
-            } else {
-                None
+/// Strip leading reference/lifetime wrappers from a type so that
+/// `&CpiContext<…>`, `&mut CpiContext<…>`, etc. are also recognised.
+fn strip_type_refs(ty: &syn::Type) -> &syn::Type {
+    if let syn::Type::Reference(r) = ty {
+        strip_type_refs(&r.elem)
+    } else {
+        ty
+    }
+}
+
+// ─── S2: is the program id supplied by a Program-typed account? ──────────────
+
+/// Returns the names of all accounts whose program id is already verified,
+/// gathered from three sources:
+///
+/// - **S2** (original) — the function's `Context<S>` parameter: look up `S`
+///   in `ctx.anchor.accounts_structs` and collect its `Program`-typed fields.
+///   Names are recorded as bare field names (e.g. `token_program`); the
+///   receiver portion of the program id text is searched for those identifiers
+///   as whole words. `resolve_program_id_text` expands let-aliases first, so
+///   `token_program.key()` where `let token_program = ctx.accounts.token_program
+///   .to_account_info()` expands to the full access path, and `token_program` is
+///   found as a whole identifier in the receiver.
+///
+/// - **S2b** (new) — the function's own typed parameters: a parameter whose
+///   declared type's final path segment is `Program` (after stripping `&` /
+///   `&mut` and lifetimes) carries an Anchor-verified id. The parameter's binding
+///   name is added directly: it will appear as a whole identifier in the receiver
+///   portion of any program id expression derived from it (e.g. binding name
+///   `token_program` in `token_program.key()`).
+///
+/// - **S2c** (new) — an `Accounts`-struct parameter passed by reference: a
+///   parameter whose type (after stripping `&` / `&mut` and lifetimes) names an
+///   `Accounts` struct in `ctx.anchor.accounts_structs` carries the same
+///   guarantees as `Context<S>`. Its `Program`-typed field names are recorded as
+///   bare names — same as S2 original. `resolve_program_id_text` expands any
+///   local let-alias (e.g. `let token_program = &accounts.token_program;` causes
+///   `token_program.key` to expand to `accounts.token_program.key`), and
+///   `whole_word_match` then finds `token_program` in the receiver portion.
+fn context_program_fields(sig: &syn::Signature, ctx: &RuleContext<'_>) -> Vec<String> {
+    let mut fields: Vec<String> = Vec::new();
+
+    for arg in &sig.inputs {
+        let syn::FnArg::Typed(t) = arg else {
+            continue;
+        };
+
+        // Extract the binding name (skip patterns that have no name).
+        let binding = match &*t.pat {
+            syn::Pat::Ident(pi) => pi.ident.to_string(),
+            _ => continue,
+        };
+
+        let ty = strip_type_refs(&t.ty);
+
+        // S2 — `Context<S>` parameter.
+        if let Some(struct_name) = context_struct_name(ty) {
+            if let Some(accounts_struct) = ctx
+                .anchor
+                .accounts_structs
+                .iter()
+                .find(|s| s.name == struct_name)
+            {
+                for field in accounts_struct
+                    .fields
+                    .iter()
+                    .filter(|f| f.ty == AccountTy::Program)
+                {
+                    fields.push(field.name.clone());
+                }
             }
-        })
-        .next()?;
+            continue;
+        }
 
-    // Look up the struct in the anchor model.
-    let accounts_struct = ctx
-        .anchor
-        .accounts_structs
-        .iter()
-        .find(|s| s.name == struct_name)?;
+        let syn::Type::Path(path) = ty else {
+            continue;
+        };
+        let Some(last_seg) = path.path.segments.last() else {
+            continue;
+        };
 
-    Some(
-        accounts_struct
-            .fields
+        // S2b — a plain `Program<'info, T>` typed parameter.
+        // The binding name itself will appear in the program id text (e.g.
+        // `token_program.key()`) so adding it directly is the right match.
+        if last_seg.ident == "Program" {
+            fields.push(binding.clone());
+            continue;
+        }
+
+        // S2c — an Accounts-struct parameter (`accounts: &mut Deposit<'info>`).
+        // The final path segment (without generics) is the struct name.
+        let struct_name = last_seg.ident.to_string();
+        if let Some(accounts_struct) = ctx
+            .anchor
+            .accounts_structs
             .iter()
-            .filter(|f| f.ty == AccountTy::Program)
-            .map(|f| f.name.clone())
-            .collect(),
-    )
+            .find(|s| s.name == struct_name)
+        {
+            // Emit bare field names. `resolve_program_id_text` will expand any
+            // local let-alias (`let token_program = &accounts.token_program;`),
+            // so the receiver will contain `token_program` as a whole word even
+            // when the call site uses the alias rather than the direct access.
+            for field in accounts_struct
+                .fields
+                .iter()
+                .filter(|f| f.ty == AccountTy::Program)
+            {
+                fields.push(field.name.clone());
+            }
+        }
+    }
+
+    fields
 }
 
 /// Resolve the program-id normalised text through one level of local `let`:
@@ -1158,6 +1296,251 @@ mod tests {
         "#,
         );
 
+        assert_eq!(f.len(), 1, "expected 1 finding, got {f:?}");
+        assert_eq!(f[0].rule_id, "VL005");
+    }
+
+    // ── S2b: Program-typed function parameter silences the finding ────────────
+
+    /// A free function taking `token_program: Program<'info, Token>` as a plain
+    /// parameter (not inside a `Context<S>`). The program id is `token_program.key()`.
+    /// Anchor verifies the program id when deserialising the `Program<>` type, so
+    /// the finding must be silent.
+    ///
+    /// This is the `bid_logic` shape from metaplex-program-library: a helper
+    /// that receives the already-validated accounts as direct arguments.
+    ///
+    /// Exercises: S2b (Program-typed parameter scan).
+    /// Killed by: removing the S2b branch in `context_program_fields` (the
+    /// `last_seg.ident == "Program"` arm).
+    #[test]
+    fn s2b_program_typed_parameter_silences_the_finding() {
+        let f = findings(
+            r#"
+            pub fn bid_logic<'info>(
+                token_program: Program<'info, Token>,
+            ) -> Result<()> {
+                invoke_signed(
+                    &spl_token::instruction::transfer(
+                        &token_program.key(),
+                        source.key,
+                        destination.key,
+                        authority.key,
+                        &[],
+                        amount,
+                    )?,
+                    &[source.clone(), destination.clone(), token_program.to_account_info()],
+                    &[],
+                )
+            }
+        "#,
+        );
+
+        // S2b: `token_program` is Program-typed, so Anchor already verified it.
+        assert!(f.is_empty(), "unexpected findings: {f:?}");
+    }
+
+    /// S2b must not over-reach: the parameter type is `AccountInfo<'info>`, not
+    /// `Program<>`. The program id is still unverified → must fire.
+    ///
+    /// Exercises: S2b negative (AccountInfo is not Program-typed).
+    /// Killed by: removing the type check (`last_seg.ident == "Program"`) so that
+    /// every parameter binding silences the finding regardless of its type.
+    #[test]
+    fn s2b_account_info_parameter_is_not_silenced() {
+        let f = findings(
+            r#"
+            pub fn bid_logic<'info>(
+                token_program: AccountInfo<'info>,
+            ) -> Result<()> {
+                invoke_signed(
+                    &spl_token::instruction::transfer(
+                        token_program.key,
+                        source.key,
+                        destination.key,
+                        authority.key,
+                        &[],
+                        amount,
+                    )?,
+                    &[source.clone(), destination.clone(), token_program.clone()],
+                    &[],
+                )
+            }
+        "#,
+        );
+
+        // `token_program` is AccountInfo, not Program — S2b does not apply.
+        assert_eq!(f.len(), 1, "expected 1 finding, got {f:?}");
+        assert_eq!(f[0].rule_id, "VL005");
+    }
+
+    // ── S2c: Accounts-struct parameter silences the finding ───────────────────
+
+    /// `fn logic<'info>(accounts: &mut Deposit<'info>, …)` where `Deposit` is a
+    /// `#[derive(Accounts)]` struct declaring `pub token_program: Program<'info,
+    /// Token>`, and the program id is taken as `accounts.token_program.key()`.
+    ///
+    /// This is the `deposit_logic` / `withdraw_logic` shape from
+    /// metaplex-program-library: the outer handler does `deposit_logic(&mut
+    /// ctx.accounts, …)`, so the inner function receives the whole accounts
+    /// struct by reference.
+    ///
+    /// Exercises: S2c (Accounts-struct parameter).
+    /// Killed by: removing the S2c branch in `context_program_fields` (the
+    /// `accounts_structs.iter().find(|s| s.name == struct_name)` arm for
+    /// non-Context, non-Program parameters).
+    #[test]
+    fn s2c_accounts_struct_parameter_silences_the_finding() {
+        let f = findings(
+            r#"
+            #[derive(Accounts)]
+            pub struct Deposit<'info> {
+                pub token_program: Program<'info, Token>,
+            }
+
+            fn deposit_logic<'info>(accounts: &mut Deposit<'info>, amount: u64) -> Result<()> {
+                let token_program = &accounts.token_program;
+                invoke(
+                    &spl_token::instruction::transfer(
+                        token_program.key,
+                        source.key,
+                        destination.key,
+                        authority.key,
+                        &[],
+                        amount,
+                    )?,
+                    &[source.clone(), destination.clone(), token_program.to_account_info()],
+                )
+            }
+        "#,
+        );
+
+        // S2c: `token_program` is a Program-typed field of `Deposit`, which
+        // Anchor verified before calling `deposit_logic`.
+        assert!(f.is_empty(), "unexpected findings: {f:?}");
+    }
+
+    /// S2c must not over-reach: the program id comes from a different,
+    /// `AccountInfo`-typed field of the same struct → must fire.
+    ///
+    /// Exercises: S2c negative (wrong field type).
+    /// Killed by: emitting every field name from the Accounts struct regardless
+    /// of its type (i.e. removing the `f.ty == AccountTy::Program` filter).
+    #[test]
+    fn s2c_account_info_field_is_not_silenced() {
+        let f = findings(
+            r#"
+            #[derive(Accounts)]
+            pub struct Deposit<'info> {
+                pub token_program: Program<'info, Token>,
+                /// CHECK: not validated
+                pub other_program: AccountInfo<'info>,
+            }
+
+            fn deposit_logic<'info>(accounts: &mut Deposit<'info>, amount: u64) -> Result<()> {
+                invoke(
+                    &spl_token::instruction::transfer(
+                        accounts.other_program.key,
+                        source.key,
+                        destination.key,
+                        authority.key,
+                        &[],
+                        amount,
+                    )?,
+                    &[source.clone(), destination.clone(), accounts.other_program.clone()],
+                )
+            }
+        "#,
+        );
+
+        // `other_program` is AccountInfo, not Program — S2c does not silence it.
+        assert_eq!(f.len(), 1, "expected 1 finding, got {f:?}");
+        assert_eq!(f[0].rule_id, "VL005");
+    }
+
+    // ── S5: CpiContext helpers are not handlers ───────────────────────────────
+
+    /// A function taking `CpiContext<…>` is a CPI helper, not an instruction
+    /// handler. Its whole purpose is to forward accounts supplied by the caller,
+    /// which includes the target program. Flagging it is unactionable; the
+    /// vulnerability, if any, is in the calling handler.
+    ///
+    /// This is the shape of every function in anchor-check/spl/src/
+    /// token_2022_extensions/ (e.g. `cpi_guard_enable`).
+    ///
+    /// Exercises: S5 (CpiContext parameter).
+    /// Killed by: removing the S5 early-return check in `check_body`.
+    #[test]
+    fn s5_cpi_context_helper_is_silent() {
+        let f = findings(
+            r#"
+            pub fn cpi_guard_enable<'info>(
+                ctx: CpiContext<'_, '_, '_, 'info, CpiGuard<'info>>,
+            ) -> Result<()> {
+                let ix = spl_token_2022::extension::cpi_guard::instruction::enable_cpi_guard(
+                    ctx.accounts.token_program_id.key,
+                    ctx.accounts.account.key,
+                    ctx.accounts.owner.key,
+                    &[],
+                )?;
+                anchor_lang::solana_program::program::invoke_signed(
+                    &ix,
+                    &[
+                        ctx.accounts.token_program_id,
+                        ctx.accounts.account,
+                        ctx.accounts.owner,
+                    ],
+                    ctx.signer_seeds,
+                )
+                .map_err(Into::into)
+            }
+        "#,
+        );
+
+        // S5: the function takes CpiContext, so it is a helper not a handler.
+        assert!(f.is_empty(), "unexpected findings: {f:?}");
+    }
+
+    /// S5 must not over-reach: the same body but with `Context<T>` instead of
+    /// `CpiContext<…>` is a real instruction handler and must fire.
+    ///
+    /// This test catches the catastrophic failure mode: a sloppy suffix or
+    /// substring match for "Context" would silence every real handler (since
+    /// `Context<T>` also ends in "Context"), making VL005 worthless while still
+    /// passing its other tests.
+    ///
+    /// Exercises: S5 negative — exact segment match, not suffix match.
+    /// Killed by: replacing `last.ident == "CpiContext"` with a suffix check
+    /// like `last.ident.to_string().ends_with("Context")`, which would then
+    /// also match `Context<T>` and silence every real handler.
+    #[test]
+    fn s5_must_not_silence_plain_context() {
+        let f = findings(
+            r#"
+            pub fn exec(ctx: Context<CpiGuard>) -> Result<()> {
+                let ix = spl_token_2022::extension::cpi_guard::instruction::enable_cpi_guard(
+                    ctx.accounts.token_program_id.key,
+                    ctx.accounts.account.key,
+                    ctx.accounts.owner.key,
+                    &[],
+                )?;
+                anchor_lang::solana_program::program::invoke_signed(
+                    &ix,
+                    &[
+                        ctx.accounts.token_program_id,
+                        ctx.accounts.account,
+                        ctx.accounts.owner,
+                    ],
+                    ctx.signer_seeds,
+                )
+                .map_err(Into::into)
+            }
+        "#,
+        );
+
+        // `Context<CpiGuard>` is a handler context — S5 must not silence it.
+        // The `token_program_id` field is not declared as `Program<>` in this test
+        // (no `#[derive(Accounts)]` struct), so S2 does not apply either.
         assert_eq!(f.len(), 1, "expected 1 finding, got {f:?}");
         assert_eq!(f[0].rule_id, "VL005");
     }
