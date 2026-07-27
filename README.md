@@ -34,10 +34,10 @@ $ vaultlint scan ./examples/vulnerable
         Account data is deserialised without verifying the account owner. An attacker can pass a look-alike account owned by another program.
         Use `Account<'info, T>`, which checks the owner and discriminator, or add `require_keys_eq!(*account.owner, crate::ID)` before reading.
 
-✗ HIGH  missing signer check
-        ./examples/vulnerable/missing_signer.rs:8
-        `authority` is not validated. Any account can be passed here.
-        Declare the field as `Signer<'info>`, add `#[account(signer)]`, `#[account(address = expected::ID)]`, a `constraint = ...`, or ensure it is pinned by a PDA's seeds or a `has_one`.
+⚠ MED  unproven authority on initialization
+        ./examples/vulnerable/unproven_authority.rs:27
+        `authority` is an unvalidated account whose key is baked into the seeds of `user_account`, initialised by this instruction, and read by the handler. Nothing proves the account authorised this, so anyone can create `user_account` naming an arbitrary `authority`.
+        Declare the field as `Signer<'info>` if it must authorise the instruction, or bind it to an account whose authority was already proven (`has_one = ...`, `constraint = ...`). If the permissionless designation is intended, suppress the finding.
 
 ⚠ MED  non-canonical PDA bump
         ./examples/vulnerable/pda_bump.rs:7
@@ -59,7 +59,7 @@ $ vaultlint scan ./examples/vulnerable
         Unchecked addition writes into account state. Solana programs are built in release mode, where overflow wraps silently.
         Use `checked_add` / `checked_sub` / `checked_mul` and handle the `None` case.
 
-6 issues found · 2 high · 4 medium
+6 issues found · 1 high · 5 medium
 ```
 
 Exit codes make it CI-ready: `0` when nothing exceeds the threshold, `1` when it does,
@@ -70,7 +70,7 @@ Exit codes make it CI-ready: `0` when nothing exceeds the threshold, `1` when it
 
 | ID | Severity | What it catches |
 |----|----------|-----------------|
-| [VL001](https://vaultlint.com/rules/VL001) | High | Authority-named `AccountInfo`/`UncheckedAccount` fields with no signer, address, constraint, seeds, or `has_one` validation |
+| [VL001](https://vaultlint.com/rules/VL001) | Medium | An unvalidated authority baked into the seeds of an account this instruction creates, and written into it |
 | [VL002](https://vaultlint.com/rules/VL002) | High | Account data deserialised without an owner check |
 | [VL003](https://vaultlint.com/rules/VL003) | Medium | Unchecked `+ - *` written into account state |
 | [VL004](https://vaultlint.com/rules/VL004) | Medium | PDAs validated with a caller-supplied bump (`bump = <instruction arg>`) |
@@ -79,12 +79,26 @@ Exit codes make it CI-ready: `0` when nothing exceeds the threshold, `1` when it
 Every rule is deliberately narrow. A linter that cries wolf on healthy code gets
 uninstalled the same day, so vaultlint prefers a missed finding to a false one.
 
-**VL001 has a known limitation.** It treats a field as validated as soon as the
-field's name is mentioned in any `#[account(...)]` constraint anywhere in the same
-struct, and it does not check what that constraint actually asserts — so an
-incidental mention (a `seeds` reference on an unrelated account, or a vacuous
-`constraint = ...`) is enough to silence it. A clean VL001 run means a check
-exists, not that it is the right one.
+**VL001 does not detect missing signer checks in general**, and you should not read
+a clean run as "authorization is correct". It detects one shape: an unvalidated
+authority-named account whose key is baked into the `seeds` of an account the same
+instruction creates, and which the handler then writes into that account. Anyone can
+call such an instruction naming an arbitrary authority. The generic version of this
+rule was tried and abandoned — every signature broad enough to catch the textbook
+case also fired on deliberately permissionless cranks, delegate designations and CPI
+forwards, at an 88% false positive rate on audited production code.
+
+The narrow rule was calibrated against a real bug: marginfi-v2 commit `95a4c26`,
+*"Authority must now sign to init account as PDA"*, whose entire diff is
+`pub authority: UncheckedAccount<'info>` → `pub authority: Signer<'info>`. VL001
+fires on the line that commit changed and is silent afterwards. Across thirteen
+open-source Solana codebases — roughly 2,100 files — it reports four findings.
+
+Its limits, stated plainly: it reads handler bodies only one call deep, so a program
+that verifies `is_signer` further away will be flagged; a field forwarded through
+`remaining_accounts` is invisible; permissionless-by-design is indistinguishable from
+a bug without protocol context, so confirm intent rather than assuming a
+vulnerability; and it only considers fields named like authorities.
 
 Silence a specific finding with a comment on its own line, or anywhere in the
 block of comments and attributes directly above it:

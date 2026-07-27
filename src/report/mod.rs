@@ -66,16 +66,16 @@ mod tests {
 
     fn finding(severity: Severity) -> Finding {
         Finding {
-            rule_id: "VL001",
+            rule_id: "VL002",
             severity,
-            title: "missing signer check",
-            message: "`authority` is not constrained as Signer.".to_string(),
+            title: "missing owner check",
+            message: "`vault` is deserialised without an owner check.".to_string(),
             file: PathBuf::from("programs/staking/src/withdraw.rs"),
             line: 42,
             column: 9,
             snippet: "pub authority: AccountInfo<'info>,".to_string(),
-            help: "Declare the field as `Signer<'info>`.",
-            docs_url: "https://vaultlint.com/rules/VL001".to_string(),
+            help: "Use `Account<'info, T>`, which checks the owner.",
+            docs_url: "https://vaultlint.com/rules/VL002".to_string(),
         }
     }
 
@@ -95,7 +95,7 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
 
         assert!(text.contains("analyzing 14 Rust files (Anchor 0.30.1)"));
-        assert!(text.contains("HIGH  missing signer check"));
+        assert!(text.contains("HIGH  missing owner check"));
         assert!(text.contains("programs/staking/src/withdraw.rs:42"));
         assert!(text.contains("1 issue found · 1 high · 0 medium"));
     }
@@ -125,10 +125,10 @@ mod tests {
         json::render(&report(vec![finding(Severity::High)]), &mut out).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
 
-        assert_eq!(parsed[0]["rule_id"], "VL001");
+        assert_eq!(parsed[0]["rule_id"], "VL002");
         assert_eq!(parsed[0]["severity"], "high");
         assert_eq!(parsed[0]["line"], 42);
-        assert_eq!(parsed[0]["docs_url"], "https://vaultlint.com/rules/VL001");
+        assert_eq!(parsed[0]["docs_url"], "https://vaultlint.com/rules/VL002");
     }
 
     #[test]
@@ -140,7 +140,7 @@ mod tests {
         assert_eq!(parsed["version"], "2.1.0");
         assert_eq!(parsed["runs"][0]["tool"]["driver"]["name"], "vaultlint");
         let result = &parsed["runs"][0]["results"][0];
-        assert_eq!(result["ruleId"], "VL001");
+        assert_eq!(result["ruleId"], "VL002");
         assert_eq!(result["level"], "warning");
         assert_eq!(
             result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
@@ -166,6 +166,6 @@ mod tests {
             .as_array()
             .unwrap();
         assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0]["id"], "VL001");
+        assert_eq!(rules[0]["id"], "VL002");
     }
 }

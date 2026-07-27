@@ -37,7 +37,7 @@ fn every_vulnerable_example_is_detected_at_the_expected_line() {
     let mut expected = vec![
         (
             "VL001".to_string(),
-            "examples/vulnerable/missing_signer.rs".to_string(),
+            "examples/vulnerable/unproven_authority.rs".to_string(),
             27,
         ),
         (
