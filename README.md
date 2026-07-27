@@ -119,7 +119,6 @@ macro, or a helper like `assert_owned_by`. It also does not flag the method form
 What it still misses: helpers taking a bare `&AccountInfo` whose callers validate are
 reported, because a rule that reads one function at a time cannot see the caller — this
 is the shape Metaplex has historically been exploited through, so the findings stay.
-Test modules and fuzz harnesses are scanned like any other code.
 
 **VL005 does not flag every unverified `invoke`.** It flags a CPI whose `Instruction`
 was built in that same function body and whose `program_id` came from an account —
@@ -132,6 +131,16 @@ Sealevel `arbitrary-cpi` bug. Accounts typed `Program<'info, T>` are silent — 
 checks that id itself — and so are CPI helpers taking a `CpiContext`, where the
 caller, not the helper, owns the check. Across the same corpus this took VL005 from
 324 findings to 21.
+
+**Test, bench and fuzz code is not scanned.** A fuzz harness deserialising raw account
+data without an owner check is the harness doing its job, not a vulnerability. Four
+things are skipped, and each is decided from a declaration rather than from a name in a
+path: files under a crate's own `tests/` or `benches/` directory, crates whose
+`Cargo.toml` carries `package.metadata.cargo-fuzz`, files declared as
+`#[cfg(test)] mod name;`, and findings inside an inline `#[cfg(test)] mod` block. The
+name-based shortcut would be wrong: Anchor's own repository keeps real on-chain programs
+under a top-level `tests/` directory. The run header tells you how many files were
+skipped.
 
 Silence a specific finding with a comment on its own line, or anywhere in the
 block of comments and attributes directly above it:
