@@ -37,8 +37,7 @@ pub fn is_suppressed(source: &str, finding: &Finding) -> bool {
     // be needed for that. This is a known limitation.
     let mut bracket_depth: usize = 0;
     let mut i = index - 1;
-    loop {
-        let Some(line) = lines.get(i) else { break };
+    while let Some(line) = lines.get(i) {
         let trimmed = line.trim();
 
         // A closing brace is a block boundary — stop here; do not absorb it.
