@@ -9,9 +9,14 @@
 //            `require_keys_eq!` before the deserialiser call.
 //   VL003 — all arithmetic into struct fields uses `checked_add` / `checked_sub`;
 //            no plain `+` / `-` / `*` on the left-hand side of a field write.
-//   VL004 — `#[instruction(amount: u64)]` is present on `Withdraw` so `amount`
-//            is in the instruction-arg set. `bump = vault.bump` is a field access,
-//            not a bare identifier, so the guard correctly ignores it.
+//   VL004 — Two PDA fields exercise both safety guards:
+//            (a) `Withdraw`: `#[instruction(amount: u64)]` is present so `amount`
+//                is in the instruction-arg set. `bump = vault.bump` is a field
+//                access, not a bare identifier, so the guard correctly ignores it.
+//            (b) `Redeem`: `bump = vault_bump` is a bare identifier, but
+//                `vault_bump` is NOT in any `#[instruction(...)]` list, so
+//                `is_instruction_arg` returns false and the rule is silent.
+//                Deleting the `is_instruction_arg` guard makes this field fire.
 //            `find_program_address` (canonical) is called in the body;
 //            `create_program_address` is not used.
 //   VL005 — `invoke` is called, but the instruction's `program_id` comes from a
@@ -59,6 +64,16 @@ pub mod staking {
             .checked_sub(amount)
             .ok_or(StakingError::MathOverflow)?;
         msg!("withdrew {} lamports; fee: {}", amount, config.fee);
+        Ok(())
+    }
+
+    /// VL004 (`is_instruction_arg` guard): `bump = vault_bump` is a bare
+    /// identifier, but `vault_bump` is not in any `#[instruction(...)]` list on
+    /// `Redeem`, so the guard returns false and the rule is silent. Deleting
+    /// `is_instruction_arg` from `pda.rs` makes this field fire.
+    pub fn redeem(ctx: Context<Redeem>) -> Result<()> {
+        let vault = &ctx.accounts.vault;
+        msg!("redeem: balance = {}", vault.balance);
         Ok(())
     }
 
@@ -117,6 +132,22 @@ pub struct Withdraw<'info> {
     pub authority: Signer<'info>,
     /// CHECK: owner is verified with require_keys_eq! before deserialisation.
     pub config: AccountInfo<'info>,
+}
+
+// `vault_bump` is a bare identifier but is NOT listed in any `#[instruction(...)]`
+// on this struct — there is no `#[instruction]` at all. `is_instruction_arg`
+// therefore returns false, and the rule is silent. This field makes that guard
+// load-bearing: deleting it causes `vault_bump` to be flagged.
+#[derive(Accounts)]
+pub struct Redeem<'info> {
+    #[account(
+        mut,
+        has_one = authority,
+        seeds = [b"vault", authority.key().as_ref()],
+        bump = vault_bump
+    )]
+    pub vault: Account<'info, Vault>,
+    pub authority: Signer<'info>,
 }
 
 #[derive(Accounts)]
