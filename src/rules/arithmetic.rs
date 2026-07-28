@@ -126,7 +126,7 @@ pub fn overflow_checks_finding(manifest: &Path) -> Finding {
              manifest. Overflow then aborts the transaction instead of writing a wrapped \
              value.",
         ),
-        docs_url: "https://vaultlint.com/rules/VL003".to_string(),
+        docs_url: "https://vaultlint.com/rules/VL003/".to_string(),
     }
 }
 

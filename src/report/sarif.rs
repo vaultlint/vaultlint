@@ -58,29 +58,29 @@ fn rule_metadata(rule_id: &str) -> RuleDescriptor {
         "VL001" => RuleDescriptor {
             name: "unproven authority on init",
             help: "Validate the authority account before using its key as a seed or storing it.",
-            docs_url: "https://vaultlint.com/rules/VL001",
+            docs_url: "https://vaultlint.com/rules/VL001/",
         },
         "VL002" => RuleDescriptor {
             name: "missing owner check",
             help: "Use `Account<'info, T>`, which checks the owner.",
-            docs_url: "https://vaultlint.com/rules/VL002",
+            docs_url: "https://vaultlint.com/rules/VL002/",
         },
         "VL003" => RuleDescriptor {
             name: "unchecked arithmetic / overflow-checks not enabled",
             help: "Enable `overflow-checks = true` under `[profile.release]`, or use \
                    `checked_add` / `checked_sub` / `checked_mul`.",
-            docs_url: "https://vaultlint.com/rules/VL003",
+            docs_url: "https://vaultlint.com/rules/VL003/",
         },
         "VL004" => RuleDescriptor {
             name: "unvalidated PDA bump",
             help: "Use `find_program_address` instead of `create_program_address`, or \
                    verify the bump against a trusted stored value.",
-            docs_url: "https://vaultlint.com/rules/VL004",
+            docs_url: "https://vaultlint.com/rules/VL004/",
         },
         "VL005" => RuleDescriptor {
             name: "unchecked CPI target",
             help: "Verify the program ID before invoking an untrusted program.",
-            docs_url: "https://vaultlint.com/rules/VL005",
+            docs_url: "https://vaultlint.com/rules/VL005/",
         },
         // Fallback for any future rule added before this table is updated.
         _ => RuleDescriptor {

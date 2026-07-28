@@ -113,7 +113,7 @@ fn finding_at(
         column: start.column + 1,
         snippet,
         help: std::borrow::Cow::Borrowed(help),
-        docs_url: format!("https://vaultlint.com/rules/{rule_id}"),
+        docs_url: format!("https://vaultlint.com/rules/{rule_id}/"),
     }
 }
 

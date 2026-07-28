@@ -75,11 +75,11 @@ Exit codes make it CI-ready: `0` when nothing exceeds the threshold, `1` when it
 
 | ID | Severity | What it catches |
 |----|----------|-----------------|
-| [VL001](https://vaultlint.com/rules/VL001) | Medium | An unvalidated authority baked into the seeds of an account this instruction creates, and written into it |
-| [VL002](https://vaultlint.com/rules/VL002) | High | Raw account data deserialised with nothing proving which program owns the account |
-| [VL003](https://vaultlint.com/rules/VL003) | Medium | A workspace that does not enable `overflow-checks`, and the arithmetic that then wraps silently |
-| [VL004](https://vaultlint.com/rules/VL004) | Medium | PDAs validated with a caller-supplied bump (`bump = <instruction arg>`) |
-| [VL005](https://vaultlint.com/rules/VL005) | Medium | A CPI whose program id comes from an account the caller controls |
+| [VL001](https://vaultlint.com/rules/VL001/) | Medium | An unvalidated authority baked into the seeds of an account this instruction creates, and written into it |
+| [VL002](https://vaultlint.com/rules/VL002/) | High | Raw account data deserialised with nothing proving which program owns the account |
+| [VL003](https://vaultlint.com/rules/VL003/) | Medium | A workspace that does not enable `overflow-checks`, and the arithmetic that then wraps silently |
+| [VL004](https://vaultlint.com/rules/VL004/) | Medium | PDAs validated with a caller-supplied bump (`bump = <instruction arg>`) |
+| [VL005](https://vaultlint.com/rules/VL005/) | Medium | A CPI whose program id comes from an account the caller controls |
 
 Every rule is deliberately narrow. A linter that cries wolf on healthy code gets
 uninstalled the same day, so vaultlint prefers a missed finding to a false one.

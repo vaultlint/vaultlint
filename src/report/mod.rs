@@ -76,7 +76,7 @@ mod tests {
             column: 9,
             snippet: "pub authority: AccountInfo<'info>,".to_string(),
             help: Cow::Borrowed("Use `Account<'info, T>`, which checks the owner."),
-            docs_url: "https://vaultlint.com/rules/VL002".to_string(),
+            docs_url: "https://vaultlint.com/rules/VL002/".to_string(),
         }
     }
 
@@ -165,7 +165,7 @@ mod tests {
         assert_eq!(parsed["findings"][0]["line"], 42);
         assert_eq!(
             parsed["findings"][0]["docs_url"],
-            "https://vaultlint.com/rules/VL002"
+            "https://vaultlint.com/rules/VL002/"
         );
     }
 
@@ -271,7 +271,7 @@ mod tests {
                 column: 1,
                 snippet: String::new(),
                 help: Cow::Borrowed("fix it"),
-                docs_url: "https://vaultlint.com/rules/VL002".to_string(),
+                docs_url: "https://vaultlint.com/rules/VL002/".to_string(),
             }],
             skipped: vec![],
             scan_root: None,
@@ -311,7 +311,7 @@ mod tests {
                 column: 1,
                 snippet: String::new(),
                 help: Cow::Borrowed("fix it"),
-                docs_url: "https://vaultlint.com/rules/VL003".to_string(),
+                docs_url: "https://vaultlint.com/rules/VL003/".to_string(),
             }],
             skipped: vec![],
             scan_root: None,
@@ -350,7 +350,7 @@ mod tests {
             column: 1,
             snippet: String::new(),
             help: Cow::Borrowed("use checked_add"),
-            docs_url: "https://vaultlint.com/rules/VL003".to_string(),
+            docs_url: "https://vaultlint.com/rules/VL003/".to_string(),
         };
         let medium_finding = Finding {
             rule_id: Cow::Borrowed("VL003"),
@@ -362,7 +362,7 @@ mod tests {
             column: 1,
             snippet: String::new(),
             help: Cow::Borrowed("add overflow-checks = true"),
-            docs_url: "https://vaultlint.com/rules/VL003".to_string(),
+            docs_url: "https://vaultlint.com/rules/VL003/".to_string(),
         };
 
         let render_with = |findings: Vec<Finding>| -> serde_json::Value {
