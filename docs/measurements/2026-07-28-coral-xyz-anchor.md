@@ -179,8 +179,9 @@ $ grep -rl "^\[workspace\]" tests --include='Cargo.toml' | while read -r m; do
       57
 ```
 
-Verified positively rather than assumed — copy one workspace out, delete the
-flag from its manifest, re-scan, and the rule speaks:
+Verified positively rather than assumed — the `lockup` workspace was copied to
+`/tmp/vl003-probe`, the `overflow-checks = true` line was deleted from its
+`Cargo.toml`, and the scan was re-run:
 
 ```
 $ vaultlint scan /tmp/vl003-probe
@@ -231,7 +232,23 @@ deploys them.
 
 **The discrimination is real, and this corpus proves it.** There are 78 Anchor
 `bump = <expr>` constraint sites under `tests/`; exactly 11 have a bare
-identifier on the right, and those are exactly the 11 the rule fires on:
+identifier on the right, and those are exactly the 11 the rule fires on.
+
+A constraint site is any `bump = <expr>` that appears inside an Anchor account
+attribute (not a struct field assignment, not a `let` binding, not a
+`ctx.bumps` read). The count uses this definition:
+
+```
+$ grep -rn "bump *=" tests --include='*.rs' \
+    | grep -v "ctx\.bumps" \
+    | grep -v "= ctx\." \
+    | grep -v "let " \
+    | grep -v "\.bump *=\s" \
+    | wc -l
+      78
+```
+
+Of those 78, the bare-identifier sites (the ones the rule fires on):
 
 ```
 $ grep -rho "bump *= *[A-Za-z_][A-Za-z0-9_]*[,)]" tests --include='*.rs' \
@@ -245,6 +262,8 @@ $ grep -rho "bump *= *[A-Za-z_][A-Za-z0-9_]*[,)]" tests --include='*.rs' \
    1 ix_data
    1 accounts
 ```
+
+The 11 unique sites (sum of counts above) match the 11 findings exactly.
 
 The 67 it stays silent on are the safe stored-canonical-bump form, and the
 corpus contains a particularly clean pair in one file — `cashiers-check/src/lib.rs` is flagged at
@@ -413,7 +432,7 @@ transcript still matches `vaultlint scan ./examples` verbatim, including its
 
 ```bash
 git clone https://github.com/coral-xyz/anchor /tmp/anchor-check
-git -C /tmp/anchor-check rev-parse HEAD        # record this
+git -C /tmp/anchor-check checkout 474204eebef7a48373eb4fca441f4c54b8e04348
 cargo build --release
 cd /tmp/anchor-check
 /path/to/vaultlint/target/release/vaultlint scan ./tests
