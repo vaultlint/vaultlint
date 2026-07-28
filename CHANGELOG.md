@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`VL002` and `VL005` now resolve `#[access_control(...)]`.** Anchor expands the
+  attribute so the named function runs — and its error aborts the instruction —
+  before the handler body, and programs put owner and program-id checks there. Both
+  rules now read that function's body as part of the handler's evidence, so a check
+  written in a guard silences the finding it covers. The call is resolved by
+  qualified name, so `CreateCheck::accounts` cannot stand in for another struct's
+  method of the same name, and only within the same file — an imported checker stays
+  invisible, which leaves the finding in place rather than inventing a silence.
+
 ### Changed
 
 - **`VL002` reports a bare `AccountInfo` parameter at Medium instead of High.** When

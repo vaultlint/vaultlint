@@ -50,6 +50,7 @@ use syn::visit::{self, Visit};
 
 use crate::anchor::{account_ty, AccountTy};
 use crate::finding::{Finding, Severity};
+use crate::rules::access_control::{self, AccessControlIndex};
 use crate::rules::{is_ident_char, normalised, whole_word_match, Rule, RuleContext};
 use crate::usesite::context_struct_name;
 
@@ -82,7 +83,11 @@ pub struct UncheckedCpi;
 
 impl Rule for UncheckedCpi {
     fn check(&self, ctx: &RuleContext<'_>, out: &mut Vec<Finding>) {
-        let mut visitor = FunctionVisitor { ctx, out };
+        let mut visitor = FunctionVisitor {
+            ctx,
+            out,
+            access_control: AccessControlIndex::of(ctx.ast),
+        };
         visitor.visit_file(ctx.ast);
     }
 }
@@ -90,10 +95,11 @@ impl Rule for UncheckedCpi {
 struct FunctionVisitor<'a, 'ctx> {
     ctx: &'a RuleContext<'ctx>,
     out: &'a mut Vec<Finding>,
+    access_control: AccessControlIndex<'ctx>,
 }
 
 impl FunctionVisitor<'_, '_> {
-    fn check_body(&mut self, sig: &syn::Signature, block: &syn::Block) {
+    fn check_body(&mut self, attrs: &[syn::Attribute], sig: &syn::Signature, block: &syn::Block) {
         // S5 — stay silent when the enclosing function is a CPI helper, not a
         // handler. CPI helpers take `CpiContext<…>` as a parameter; handlers
         // take `Context<T>`. The helper cannot verify accounts it was handed
@@ -112,8 +118,13 @@ impl FunctionVisitor<'_, '_> {
             return;
         }
 
-        // S1 — fast exit: a verification signal is present anywhere in the body.
-        let body_text = normalised(block);
+        // S1 — fast exit: a verification signal is present anywhere in the body,
+        // or in an `#[access_control(...)]` guard, which Anchor runs — and lets
+        // fail the instruction — before the body. Only the silencer looks at the
+        // guard; the `invoke` calls are still collected from `block` alone.
+        let guards = self.access_control.blocks_for(attrs);
+        let guarded = (!guards.is_empty()).then(|| access_control::merged_with(block, &guards));
+        let body_text = normalised(guarded.as_ref().unwrap_or(block));
         if VERIFICATION_SIGNALS
             .iter()
             .any(|signal| body_text.contains(signal))
@@ -192,11 +203,11 @@ impl FunctionVisitor<'_, '_> {
 
 impl<'ast> Visit<'ast> for FunctionVisitor<'_, '_> {
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        self.check_body(&node.sig, &node.block);
+        self.check_body(&node.attrs, &node.sig, &node.block);
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        self.check_body(&node.sig, &node.block);
+        self.check_body(&node.attrs, &node.sig, &node.block);
     }
 }
 
@@ -1860,5 +1871,58 @@ mod tests {
         // (no `#[derive(Accounts)]` struct), so S2 does not apply either.
         assert_eq!(f.len(), 1, "expected 1 finding, got {f:?}");
         assert_eq!(f[0].rule_id, "VL005");
+    }
+
+    /// Anchor's `#[access_control(f(&ctx))]` runs `f` before the body and lets
+    /// its error abort the instruction, so a program-id check written there is
+    /// as binding as one written inline. Before this, S1 saw only the body and
+    /// the whole idiom was invisible.
+    ///
+    /// Killing mutation: in `check_body`, normalise `block` rather than the
+    /// guard-merged block.
+    #[test]
+    fn an_access_control_guard_silences_the_cpi_it_protects() {
+        let f = findings(
+            r#"
+            #[access_control(verify_program(&ctx))]
+            pub fn claim(ctx: Context<Claim>) -> Result<()> {
+                let ix = Instruction { program_id: *ctx.accounts.target.key, accounts: vec![], data: vec![] };
+                invoke(&ix, &[a.clone()])?;
+                Ok(())
+            }
+
+            fn verify_program(ctx: &Context<Claim>) -> Result<()> {
+                require_keys_eq!(ctx.accounts.target.key(), anchor_spl::token::ID);
+                Ok(())
+            }
+        "#,
+        );
+
+        assert!(f.is_empty(), "expected no findings, got {f:?}");
+    }
+
+    /// The attribute is what makes the helper run. A helper merely present in
+    /// the file proves nothing about a handler that never calls it.
+    ///
+    /// Killing mutation: in `AccessControlIndex::blocks_for`, return every
+    /// block in the file.
+    #[test]
+    fn a_helper_without_the_attribute_does_not_silence() {
+        let f = findings(
+            r#"
+            pub fn claim(ctx: Context<Claim>) -> Result<()> {
+                let ix = Instruction { program_id: *ctx.accounts.target.key, accounts: vec![], data: vec![] };
+                invoke(&ix, &[a.clone()])?;
+                Ok(())
+            }
+
+            fn verify_program(ctx: &Context<Claim>) -> Result<()> {
+                require_keys_eq!(ctx.accounts.target.key(), anchor_spl::token::ID);
+                Ok(())
+            }
+        "#,
+        );
+
+        assert_eq!(f.len(), 1, "expected 1 finding, got {f:?}");
     }
 }

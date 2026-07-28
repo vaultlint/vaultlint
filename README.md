@@ -129,6 +129,17 @@ another function, and a question it cannot answer must not fail your build by de
 Everything else VL002 reports — an account the handler itself holds and never checks —
 stays High.
 
+**`#[access_control(...)]` is resolved, for VL002 and VL005.** Anchor expands the
+attribute so the named function runs — and its error aborts the instruction — before
+the handler body, and programs put exactly these checks there. Both rules read that
+function's body as part of the handler's evidence, so a check written in a guard
+silences the finding it covers. Two limits: the call is resolved by qualified name, so
+`CreateCheck::accounts` never matches another struct's method of the same name, and it
+is resolved only within the same file — a checker imported from elsewhere is invisible
+and the finding stays. VL001 does not follow the attribute; it reaches handler bodies
+through the cross-file use-site index, where the merged body that would silence it
+would also feed the trigger that fires it.
+
 **VL003 is a question about your build profile, asked once.** With
 `[profile.release] overflow-checks = true` an overflow panics: the transaction aborts
 and no funds move. Solana programs are built in release mode, so that one line switches

@@ -34,6 +34,7 @@ use syn::visit::{self, Visit};
 
 use crate::anchor::{AccountsStruct, Constraint};
 use crate::finding::{Finding, Severity};
+use crate::rules::access_control::{self, AccessControlIndex};
 use crate::rules::{is_ident_char, normalised, whole_word_match, Rule, RuleContext};
 use crate::usesite::context_struct_name;
 
@@ -78,6 +79,7 @@ impl Rule for MissingOwnerCheck {
         let mut visitor = FunctionVisitor {
             ctx,
             out,
+            access_control: AccessControlIndex::of(ctx.ast),
             impl_self_ty: None,
         };
         visitor.visit_file(ctx.ast);
@@ -87,6 +89,7 @@ impl Rule for MissingOwnerCheck {
 struct FunctionVisitor<'a, 'ctx> {
     ctx: &'a RuleContext<'ctx>,
     out: &'a mut Vec<Finding>,
+    access_control: AccessControlIndex<'ctx>,
     /// Final path segment of the enclosing `impl` block's self type, so that a
     /// handler declared `ctx: Context<Self>` can still be resolved to its
     /// `Accounts` struct. Squads-v4 writes every account-closing instruction
@@ -95,8 +98,16 @@ struct FunctionVisitor<'a, 'ctx> {
 }
 
 impl FunctionVisitor<'_, '_> {
-    fn check_body(&mut self, sig: &syn::Signature, block: &syn::Block) {
-        if has_owner_check(block) {
+    /// `attrs` are the annotated function's own, so an `#[access_control(...)]`
+    /// guard counts as evidence: Anchor runs it, and its error aborts the
+    /// instruction, before a single statement of `block`. The guard feeds the
+    /// silencers only — the reads still have to be in `block`.
+    fn check_body(&mut self, attrs: &[syn::Attribute], sig: &syn::Signature, block: &syn::Block) {
+        let guards = self.access_control.blocks_for(attrs);
+        let guarded = (!guards.is_empty()).then(|| access_control::merged_with(block, &guards));
+        let evidence_block = guarded.as_ref().unwrap_or(block);
+
+        if has_owner_check(evidence_block) {
             return;
         }
         let ctx = self.ctx;
@@ -109,7 +120,7 @@ impl FunctionVisitor<'_, '_> {
             raw_read_locals: &raw_read_locals,
         };
         finder.visit_block(block);
-        let evidence = AddressEvidence::of(block);
+        let evidence = AddressEvidence::of(evidence_block);
         let params = account_info_params(sig);
         for read in finder.reads {
             if pda_address_check_covers(&read, &evidence)
@@ -150,11 +161,11 @@ impl FunctionVisitor<'_, '_> {
 
 impl<'ast> Visit<'ast> for FunctionVisitor<'_, '_> {
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        self.check_body(&node.sig, &node.block);
+        self.check_body(&node.attrs, &node.sig, &node.block);
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        self.check_body(&node.sig, &node.block);
+        self.check_body(&node.attrs, &node.sig, &node.block);
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
@@ -1328,6 +1339,87 @@ mod tests {
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::High);
+    }
+
+    /// Anchor runs `#[access_control(f(&ctx))]` before the handler body and its
+    /// error aborts the instruction, so an owner check inside `f` guards every
+    /// read in the handler just as one written inline would.
+    ///
+    /// Killing mutation: in `check_body`, pass `block` to `has_owner_check`
+    /// instead of `evidence_block`.
+    #[test]
+    fn an_access_control_guard_silences_the_read_it_protects() {
+        let findings = findings_for(
+            r#"
+            #[access_control(verify_config(&ctx))]
+            pub fn read_config(ctx: Context<ReadConfig>) -> Result<()> {
+                let account = &ctx.accounts.config;
+                let config = Config::try_from_slice(&account.data.borrow())?;
+                Ok(())
+            }
+
+            fn verify_config(ctx: &Context<ReadConfig>) -> Result<()> {
+                require_keys_eq!(*ctx.accounts.config.owner, crate::ID);
+                Ok(())
+            }
+        "#,
+            &MissingOwnerCheck,
+        );
+
+        assert!(findings.is_empty());
+    }
+
+    /// The guard must be a guard, not any function that happens to be in the
+    /// file. Without the attribute the same helper proves nothing about this
+    /// handler, because nothing makes it run.
+    ///
+    /// Killing mutation: in `AccessControlIndex::named_functions`, return every
+    /// function in the file regardless of the attribute.
+    #[test]
+    fn an_unreferenced_helper_does_not_silence() {
+        let findings = findings_for(
+            r#"
+            pub fn read_config(ctx: Context<ReadConfig>) -> Result<()> {
+                let account = &ctx.accounts.config;
+                let config = Config::try_from_slice(&account.data.borrow())?;
+                Ok(())
+            }
+
+            fn verify_config(ctx: &Context<ReadConfig>) -> Result<()> {
+                require_keys_eq!(*ctx.accounts.config.owner, crate::ID);
+                Ok(())
+            }
+        "#,
+            &MissingOwnerCheck,
+        );
+
+        assert_eq!(findings.len(), 1);
+    }
+
+    /// A raw read *inside* the guard is the guard's own finding, reported once
+    /// against the guard — not a second time against every handler that runs it.
+    ///
+    /// Killing mutation: in `check_body`, run `RawReadFinder` over
+    /// `evidence_block` instead of `block`.
+    #[test]
+    fn a_read_inside_the_guard_is_not_attributed_to_the_handler() {
+        let findings = findings_for(
+            r#"
+            #[access_control(verify_config(&ctx))]
+            pub fn read_config(ctx: Context<ReadConfig>) -> Result<()> {
+                Ok(())
+            }
+
+            fn verify_config(ctx: &Context<ReadConfig>) -> Result<()> {
+                let config = Config::try_from_slice(&ctx.accounts.config.data.borrow())?;
+                Ok(())
+            }
+        "#,
+            &MissingOwnerCheck,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].line, 8);
     }
 
     /// A typed Anchor parameter is not the blind spot: `Account<'info, T>` has

@@ -1,3 +1,4 @@
+mod access_control;
 pub mod arithmetic;
 pub mod cpi;
 pub mod init_authority;
