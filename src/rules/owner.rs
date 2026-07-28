@@ -110,14 +110,29 @@ impl FunctionVisitor<'_, '_> {
         };
         finder.visit_block(block);
         let evidence = AddressEvidence::of(block);
+        let params = account_info_params(sig);
         for read in finder.reads {
             if pda_address_check_covers(&read, &evidence)
                 || anchor_address_constraint_covers(&read, accounts)
             {
                 continue;
             }
-            self.out.push(
-                ctx.finding(
+            self.out.push(match read_parameter(&read, &params) {
+                Some(name) => ctx.finding(
+                    "VL002",
+                    Severity::Medium,
+                    "missing owner check",
+                    format!(
+                        "`{name}` is a bare `AccountInfo` parameter, deserialised here without \
+                         verifying the account owner. VaultLint reads one function at a time, \
+                         so a check performed by the caller is invisible to it."
+                    ),
+                    "Verify inside the helper with `require_keys_eq!(*account.owner, expected::ID)`, \
+                 or take a typed `Account<'info, T>` parameter instead of a bare `AccountInfo`. \
+                 If every call site already validates, suppress the finding.",
+                    read.span,
+                ),
+                None => ctx.finding(
                     "VL002",
                     Severity::High,
                     "missing owner check",
@@ -128,7 +143,7 @@ impl FunctionVisitor<'_, '_> {
                  or add `require_keys_eq!(*account.owner, crate::ID)` before reading.",
                     read.span,
                 ),
-            );
+            });
         }
     }
 }
@@ -182,6 +197,56 @@ fn type_final_segment(ty: &syn::Type) -> Option<String> {
         .segments
         .last()
         .map(|segment| segment.ident.to_string())
+}
+
+/// Parameters declared as a bare `AccountInfo`, by name.
+///
+/// These are the reads the rule cannot judge on its own evidence: the account
+/// arrives already chosen, and whatever the caller proved about it is in
+/// another function. The finding is still made — a helper deserialising an
+/// unvalidated `&AccountInfo` is the shape Metaplex has historically been
+/// exploited through — but at Medium, because the absence of a check *here* is
+/// not the same evidence as the absence of a check in a handler that owns the
+/// account. Making it a High would fail every default `--fail-on high` build
+/// on a question the rule admits it cannot answer.
+fn account_info_params(sig: &syn::Signature) -> Vec<String> {
+    sig.inputs
+        .iter()
+        .filter_map(|arg| {
+            let syn::FnArg::Typed(typed) = arg else {
+                return None;
+            };
+            if type_final_segment(peel_refs(&typed.ty))? != "AccountInfo" {
+                return None;
+            }
+            let syn::Pat::Ident(pat_ident) = unwrap_pat_type(&typed.pat) else {
+                return None;
+            };
+            Some(pat_ident.ident.to_string())
+        })
+        .collect()
+}
+
+fn peel_refs(ty: &syn::Type) -> &syn::Type {
+    let mut rest = ty;
+    while let syn::Type::Reference(reference) = rest {
+        rest = &reference.elem;
+    }
+    rest
+}
+
+/// The `AccountInfo` parameter this read draws its bytes from, if any.
+///
+/// Any candidate receiver matching is enough: they all name the same read, and
+/// a parameter among them means the caller is part of the answer.
+fn read_parameter<'a>(read: &RawRead, params: &'a [String]) -> Option<&'a str> {
+    read.receivers.iter().find_map(|receiver| {
+        let head = leading_ident(receiver);
+        params
+            .iter()
+            .find(|param| *param == head)
+            .map(String::as_str)
+    })
 }
 
 // ─── silencer ────────────────────────────────────────────────────────────────
@@ -1214,5 +1279,76 @@ mod tests {
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, "VL002");
+    }
+
+    /// The auction-house shape: a helper deserialises a bare `&AccountInfo`
+    /// parameter and the only call site validates it. Still reported — the
+    /// caller could equally not validate — but at Medium, because the rule
+    /// cannot see the caller and must not fail a default build on it.
+    ///
+    /// Killing mutation: in `check_body`, always take the `None` arm.
+    #[test]
+    fn a_bare_account_info_parameter_is_reported_at_medium() {
+        let findings = findings_for(
+            r#"
+            pub fn pay_creator_fees<'a>(
+                metadata_info: &AccountInfo<'a>,
+                size: u64,
+            ) -> Result<u64> {
+                let metadata = Metadata::try_from_slice(&metadata_info.data.borrow())?;
+                Ok(metadata.seller_fee_basis_points as u64)
+            }
+        "#,
+            &MissingOwnerCheck,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Medium);
+        assert!(findings[0].message.contains("metadata_info"));
+    }
+
+    /// The counterweight: an account the function itself holds is judged on
+    /// this function's own evidence, so it stays High. Without this, downgrading
+    /// every read would pass the test above and leave the rule with no High.
+    ///
+    /// Killing mutation: in `account_info_params`, drop the `AccountInfo` type
+    /// test and return every parameter name.
+    #[test]
+    fn a_read_of_an_account_the_function_holds_stays_high() {
+        let findings = findings_for(
+            r#"
+            pub fn read_config(ctx: Context<ReadConfig>) -> Result<()> {
+                let account = &ctx.accounts.config;
+                let config = Config::try_from_slice(&account.data.borrow())?;
+                Ok(())
+            }
+        "#,
+            &MissingOwnerCheck,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::High);
+    }
+
+    /// A typed Anchor parameter is not the blind spot: `Account<'info, T>` has
+    /// already checked the owner, so a function taking one must not be
+    /// downgraded on that account's behalf.
+    ///
+    /// Killing mutation: in `account_info_params`, accept any parameter whose
+    /// type name merely contains `Account`.
+    #[test]
+    fn a_typed_account_parameter_does_not_downgrade() {
+        let findings = findings_for(
+            r#"
+            pub fn read_config(config: &Account<'info, Config>, raw: &AccountInfo) -> Result<()> {
+                let other = Config::try_from_slice(&config.data.borrow())?;
+                Ok(())
+            }
+        "#,
+            &MissingOwnerCheck,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::High);
     }
 }

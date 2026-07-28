@@ -76,7 +76,7 @@ Exit codes make it CI-ready: `0` when nothing exceeds the threshold, `1` when it
 | ID | Severity | What it catches |
 |----|----------|-----------------|
 | [VL001](https://vaultlint.com/rules/VL001/) | Medium | An unvalidated authority baked into the seeds of an account this instruction creates, and written into it |
-| [VL002](https://vaultlint.com/rules/VL002/) | High | Raw account data deserialised with nothing proving which program owns the account |
+| [VL002](https://vaultlint.com/rules/VL002/) | High / Medium | Raw account data deserialised with nothing proving which program owns the account |
 | [VL003](https://vaultlint.com/rules/VL003/) | Medium | A workspace that does not enable `overflow-checks`, and the arithmetic that then wraps silently |
 | [VL004](https://vaultlint.com/rules/VL004/) | Medium | PDAs validated with a caller-supplied bump (`bump = <instruction arg>`) |
 | [VL005](https://vaultlint.com/rules/VL005/) | Medium | A CPI whose program id comes from an account the caller controls |
@@ -121,9 +121,13 @@ account. VL002 needs `.owner` in a checking position — a comparison, a `requir
 macro, or a helper like `assert_owned_by`. It also does not flag the method form
 `account.try_deserialize(...)`, which is the *safe* Anchor path.
 
-What it still misses: helpers taking a bare `&AccountInfo` whose callers validate are
-reported, because a rule that reads one function at a time cannot see the caller — this
-is the shape Metaplex has historically been exploited through, so the findings stay.
+Helpers taking a bare `&AccountInfo` whose callers validate are still reported, because
+a rule that reads one function at a time cannot see the caller — this is the shape
+Metaplex has historically been exploited through, so the findings stay. They are
+reported at **Medium**, not High: the rule is admitting that the evidence it needs is in
+another function, and a question it cannot answer must not fail your build by default.
+Everything else VL002 reports — an account the handler itself holds and never checks —
+stays High.
 
 **VL003 is a question about your build profile, asked once.** With
 `[profile.release] overflow-checks = true` an overflow panics: the transaction aborts

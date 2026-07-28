@@ -7,6 +7,14 @@ evidence of what those changes did to a third-party tree.
 **Re-run this before the next release and diff it against this file.** The
 "how to reproduce" section at the bottom is the whole procedure.
 
+**One number here has since been changed on purpose.** The VL002 finding at
+`utils.rs:301` — the single High in this run, and the sole reason the process
+exited 1 — is now reported at Medium, because the account arrives as a bare
+`AccountInfo` parameter and the caller's proof is out of reach. The finding
+still fires and the count is still 21; only the severity and the exit code
+moved. A re-run on unchanged vaultlint should therefore read `21 issues found
+· 0 high · 21 medium`, exit 0. Everything else below stands as written.
+
 ## Identity
 
 | | |

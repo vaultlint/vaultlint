@@ -7,7 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **`VL002` reports a bare `AccountInfo` parameter at Medium instead of High.** When
+  the deserialised account arrives as a helper's `&AccountInfo` argument, whatever the
+  caller proved about it is in another function, and VL002 reads one function at a
+  time. The finding stays — a helper that trusts its caller is the shape Metaplex has
+  historically been exploited through — but the rule no longer fails a default
+  `--fail-on high` build on a question it admits it cannot answer. An account the
+  handler itself holds and never checks is still High. On the `coral-xyz/anchor`
+  measurement corpus this is the difference between exit 1 and exit 0; the finding
+  count is unchanged.
 
 ## [0.1.0] — 2026-07-28
 
