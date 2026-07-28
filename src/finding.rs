@@ -13,7 +13,7 @@ pub enum Severity {
 }
 
 impl Severity {
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Severity::Low => "LOW",
             Severity::Medium => "MED",
@@ -45,7 +45,7 @@ impl std::str::FromStr for Severity {
     }
 }
 
-/// Error returned by [`Severity::from_str`] when the input is not recognised.
+/// Error returned by [`FromStr`](std::str::FromStr) when the input is not recognised.
 #[derive(Debug, PartialEq, Eq)]
 pub struct UnknownSeverity(String);
 

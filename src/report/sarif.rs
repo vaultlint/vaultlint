@@ -8,7 +8,7 @@ use crate::finding::{Finding, Severity};
 use crate::project::normalised;
 use crate::ScanReport;
 
-pub fn render(report: &ScanReport, out: &mut dyn Write) -> anyhow::Result<()> {
+pub fn render(report: &ScanReport, out: &mut dyn Write) -> std::io::Result<()> {
     let scan_root = report.scan_root.as_deref();
     let mut run = json!({
         "tool": {

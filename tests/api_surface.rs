@@ -24,14 +24,14 @@ fn scan_options_can_be_constructed_via_new() {
 
 // ── R8-2: `Debug` on the public structs and anchor types ─────────────────────
 
-/// `ScanOptions`, `ScanReport`, `SkippedFile`, `Finding`, `AnchorModel`,
-/// `AccountsStruct`, and `AccountField` must all implement `Debug`.
+/// `ScanOptions`, `ScanReport`, `SkippedFile`, and `Finding` must all implement `Debug`.
+/// The anchor types (`AnchorModel`, `AccountsStruct`, `AccountField`) also derive `Debug`
+/// but are no longer public; their `Debug` impls are covered by in-crate unit tests.
 ///
 /// Kill (ScanOptions): remove `#[derive(Debug)]` from `ScanOptions`.
 /// Kill (ScanReport): remove `#[derive(Debug)]` from `ScanReport`.
 /// Kill (SkippedFile): remove `#[derive(Debug)]` from `SkippedFile`.
 /// Kill (Finding): remove `#[derive(Debug)]` from `Finding`.
-/// Kill (AnchorModel): remove `#[derive(Debug)]` from `AnchorModel`.
 /// One kill per type breaks its assertion.
 #[test]
 fn public_types_implement_debug() {
@@ -73,25 +73,6 @@ fn public_types_implement_debug() {
         "expected at least one finding for Debug test"
     );
     let _ = format!("{:?}", report.findings[0]);
-}
-
-/// The three anchor types must implement `Debug`.
-///
-/// Kill: remove `#[derive(Debug)]` from `AnchorModel`.
-/// Then `format!("{:?}", model)` does not compile.
-#[test]
-fn anchor_types_implement_debug() {
-    use vaultlint::anchor::{AccountsStruct, AnchorModel};
-
-    let model = AnchorModel {
-        accounts_structs: vec![AccountsStruct {
-            name: "Withdraw".to_string(),
-            instruction_args: vec![],
-            fields: vec![],
-        }],
-    };
-    let _ = format!("{model:?}");
-    let _ = format!("{:?}", model.accounts_structs[0]);
 }
 
 // ── R8-3: `Display` and `FromStr` for `Severity` ────────────────────────────
@@ -199,20 +180,8 @@ fn json_round_trip_of_scan_report() {
     );
     for (original, restored) in report.findings.iter().zip(deserialized.iter()) {
         assert_eq!(
-            original.rule_id, restored.rule_id,
-            "round-trip must preserve rule_id"
-        );
-        assert_eq!(
-            original.severity, restored.severity,
-            "round-trip must preserve severity"
-        );
-        assert_eq!(
-            original.title, restored.title,
-            "round-trip must preserve title"
-        );
-        assert_eq!(
-            original.line, restored.line,
-            "round-trip must preserve line"
+            original, restored,
+            "round-trip must be lossless for every field"
         );
     }
 }

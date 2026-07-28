@@ -1,4 +1,4 @@
-pub mod anchor;
+pub(crate) mod anchor;
 pub mod finding;
 pub(crate) mod parse;
 pub(crate) mod project;

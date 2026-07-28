@@ -50,7 +50,7 @@ pub enum Constraint {
     Other(String, String),
 }
 
-pub fn build(file: &syn::File) -> AnchorModel {
+pub(crate) fn build(file: &syn::File) -> AnchorModel {
     let mut accounts_structs = Vec::new();
     collect(&file.items, &mut accounts_structs);
     AnchorModel { accounts_structs }

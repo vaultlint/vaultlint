@@ -17,10 +17,6 @@ fn is_bare_identifier(expr: &str) -> bool {
 }
 
 impl Rule for UnvalidatedPdaBump {
-    fn id(&self) -> &'static str {
-        "VL004"
-    }
-
     fn check(&self, ctx: &RuleContext<'_>, out: &mut Vec<Finding>) {
         for accounts in &ctx.anchor.accounts_structs {
             for field in &accounts.fields {

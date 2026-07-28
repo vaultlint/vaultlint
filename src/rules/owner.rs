@@ -74,10 +74,6 @@ const RAW_READ_SIGNALS: &[&str] = &[
 pub struct MissingOwnerCheck;
 
 impl Rule for MissingOwnerCheck {
-    fn id(&self) -> &'static str {
-        "VL002"
-    }
-
     fn check(&self, ctx: &RuleContext<'_>, out: &mut Vec<Finding>) {
         let mut visitor = FunctionVisitor {
             ctx,

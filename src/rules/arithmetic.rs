@@ -9,10 +9,6 @@ use crate::rules::{Rule, RuleContext};
 pub struct UncheckedArithmetic;
 
 impl Rule for UncheckedArithmetic {
-    fn id(&self) -> &'static str {
-        "VL003"
-    }
-
     fn check(&self, ctx: &RuleContext<'_>, out: &mut Vec<Finding>) {
         if ctx.overflow_checks {
             return;

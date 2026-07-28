@@ -12,7 +12,7 @@ struct SkippedEntry<'a> {
     reason: &'a str,
 }
 
-pub fn render(report: &ScanReport, out: &mut dyn Write) -> anyhow::Result<()> {
+pub fn render(report: &ScanReport, out: &mut dyn Write) -> std::io::Result<()> {
     let skipped: Vec<SkippedEntry<'_>> = report
         .skipped
         .iter()

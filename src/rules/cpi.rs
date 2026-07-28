@@ -81,10 +81,6 @@ const VERIFICATION_SIGNALS: &[&str] = &["require_keys_eq!", "::ID", "assert_eq!(
 pub struct UncheckedCpi;
 
 impl Rule for UncheckedCpi {
-    fn id(&self) -> &'static str {
-        "VL005"
-    }
-
     fn check(&self, ctx: &RuleContext<'_>, out: &mut Vec<Finding>) {
         let mut visitor = FunctionVisitor { ctx, out };
         visitor.visit_file(ctx.ast);

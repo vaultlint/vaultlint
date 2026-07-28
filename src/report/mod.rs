@@ -17,7 +17,7 @@ pub fn render(
     format: Format,
     out: &mut dyn std::io::Write,
     colour: bool,
-) -> anyhow::Result<()> {
+) -> std::io::Result<()> {
     match format {
         Format::Human => human::render(report, out, colour)?,
         Format::Json => json::render(report, out)?,

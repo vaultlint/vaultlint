@@ -13,8 +13,6 @@ use crate::finding::{Finding, Severity};
 use crate::usesite::UseSiteIndex;
 
 pub trait Rule {
-    #[allow(dead_code)]
-    fn id(&self) -> &'static str;
     fn check(&self, ctx: &RuleContext<'_>, out: &mut Vec<Finding>);
 }
 
