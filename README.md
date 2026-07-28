@@ -33,36 +33,43 @@ $ vaultlint scan ./examples/vulnerable
         ./examples/vulnerable/missing_owner.rs:5
         Account data is deserialised without verifying the account owner. An attacker can pass a look-alike account owned by another program.
         Use `Account<'info, T>`, which checks the owner and discriminator, or add `require_keys_eq!(*account.owner, crate::ID)` before reading.
+        https://vaultlint.com/rules/VL002/
 
 ⚠ MED  non-canonical PDA bump
         ./examples/vulnerable/pda_bump.rs:7
         `vault` uses `bump = user_bump`, where `user_bump` is an `#[instruction]` argument. An attacker controls this value and can pass a non-canonical bump to address a different account.
         Store the canonical bump (from `init`) in the account data and validate with `bump = <account>.bump`.
+        https://vaultlint.com/rules/VL004/
 
 ⚠ MED  unchecked CPI to unknown program
         ./examples/vulnerable/unchecked_cpi.rs:10
         `*ctx.accounts.target_program.key` supplies the program id for this CPI, and nothing in the handler proves which program it is. An attacker who controls that account can point the invocation at their own program.
         Use Anchor's typed CPI helpers, or verify the id first, e.g. `require_keys_eq!(program.key(), expected::ID)`.
+        https://vaultlint.com/rules/VL005/
 
 ⚠ MED  unproven authority on initialization
         ./examples/vulnerable/unproven_authority.rs:27
         `authority` is an unvalidated account whose key is baked into the seeds of `user_account`, initialised by this instruction, and read by the handler. Nothing proves the account authorised this, so anyone can create `user_account` naming an arbitrary `authority`.
         Declare the field as `Signer<'info>` if it must authorise the instruction, or bind it to an account whose authority was already proven (`has_one = ...`, `constraint = ...`). If the permissionless designation is intended, suppress the finding.
+        https://vaultlint.com/rules/VL001/
 
 ⚠ MED  overflow-checks is not enabled
         Cargo.toml:1
         This workspace does not set `overflow-checks = true` under `[profile.release]`. Solana programs are built in release mode, so arithmetic that overflows wraps silently instead of aborting the transaction.
         Add `[profile.release]` with `overflow-checks = true` to the workspace manifest. Overflow then aborts the transaction instead of writing a wrapped value.
+        https://vaultlint.com/rules/VL003/
 
 ⚠ LOW  unchecked arithmetic
         ./examples/vulnerable/unchecked_math.rs:4
         Unchecked subtraction writes into a struct field, and this workspace does not enable `overflow-checks`, so an overflow wraps silently instead of aborting the transaction.
         Enable `overflow-checks` for the release profile, or use `checked_add` / `checked_sub` / `checked_mul` and handle the `None` case.
+        https://vaultlint.com/rules/VL003/
 
 ⚠ LOW  unchecked arithmetic
         ./examples/vulnerable/unchecked_math.rs:5
         Unchecked addition writes into a struct field, and this workspace does not enable `overflow-checks`, so an overflow wraps silently instead of aborting the transaction.
         Enable `overflow-checks` for the release profile, or use `checked_add` / `checked_sub` / `checked_mul` and handle the `None` case.
+        https://vaultlint.com/rules/VL003/
 
 7 issues found · 1 high · 4 medium · 2 low
 ```

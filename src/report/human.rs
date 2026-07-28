@@ -53,6 +53,7 @@ pub fn render(report: &ScanReport, out: &mut dyn Write, colour: bool) -> std::io
         writeln!(out, "        {}:{}", finding.file.display(), finding.line)?;
         writeln!(out, "        {}", finding.message)?;
         writeln!(out, "        {}", finding.help)?;
+        writeln!(out, "        {}", link(&finding.docs_url, colour))?;
     }
 
     let high = count(report, Severity::High);
@@ -68,6 +69,18 @@ pub fn render(report: &ScanReport, out: &mut dyn Write, colour: bool) -> std::io
         write!(out, " · {low} low")?;
     }
     writeln!(out)
+}
+
+/// The rule's documentation page. It is also the only place the human report
+/// spells the rule id, which is what a `// vaultlint:allow VL002` comment
+/// needs — the alternative, a column of ids in the heading, would say the same
+/// thing twice.
+fn link(url: &str, colour: bool) -> String {
+    if colour {
+        url.dimmed().to_string()
+    } else {
+        url.to_string()
+    }
 }
 
 fn count(report: &ScanReport, severity: Severity) -> usize {
@@ -98,5 +111,57 @@ fn paint(text: &str, severity: Severity, colour: bool) -> String {
         Severity::High => text.red().bold().to_string(),
         Severity::Medium => text.yellow().to_string(),
         Severity::Low => text.blue().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one_finding_report() -> ScanReport {
+        ScanReport {
+            files_scanned: 1,
+            test_files_skipped: 0,
+            anchor_version: None,
+            findings: vec![Finding {
+                rule_id: "VL002".into(),
+                severity: Severity::High,
+                title: "missing owner check".into(),
+                message: "message".to_string(),
+                file: std::path::PathBuf::from("lib.rs"),
+                line: 5,
+                column: 1,
+                snippet: String::new(),
+                help: "help".into(),
+                docs_url: "https://vaultlint.com/rules/VL002/".to_string(),
+            }],
+            skipped: Vec::new(),
+            scan_root: None,
+        }
+    }
+
+    fn render_to_string(colour: bool) -> String {
+        let mut out = Vec::new();
+        render(&one_finding_report(), &mut out, colour).expect("writing to a Vec cannot fail");
+        String::from_utf8(out).expect("output is UTF-8")
+    }
+
+    /// The URL is the only place the human report names the rule, so a reader
+    /// who wants to suppress the finding has nowhere else to read `VL002` from.
+    ///
+    /// Killing mutation: drop the `docs_url` line from the finding loop.
+    #[test]
+    fn a_finding_carries_its_documentation_url() {
+        assert!(render_to_string(false).contains("https://vaultlint.com/rules/VL002/"));
+    }
+
+    /// Piped output must stay free of escape sequences — CI logs and `grep` see
+    /// this, and a colour code in the middle of the URL breaks a copy-paste.
+    ///
+    /// Killing mutation: in `link`, return `url.dimmed().to_string()`
+    /// unconditionally.
+    #[test]
+    fn the_url_is_unstyled_when_colour_is_off() {
+        assert!(!render_to_string(false).contains('\u{1b}'));
     }
 }
