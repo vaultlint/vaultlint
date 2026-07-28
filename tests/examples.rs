@@ -3,6 +3,54 @@ use std::process::Command;
 
 use vaultlint::{scan, ScanOptions};
 
+/// A relative scan root whose workspace root lives above the process CWD must
+/// resolve the workspace root correctly and emit zero VL003 findings when the
+/// root enables `overflow-checks`.
+///
+/// Kill: drop the `std::path::absolute` call from `normalised`, so the walk
+/// stops at the CWD and the member manifest decides.
+#[test]
+fn relative_scan_root_sees_workspace_overflow_checks_above_cwd() {
+    let dir = std::env::temp_dir().join("vaultlint_c2_relative_root");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("member/src")).unwrap();
+    // Workspace root enables overflow-checks.
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"member\"]\n\n[profile.release]\noverflow-checks = true\n",
+    )
+    .unwrap();
+    // Member has no profile of its own.
+    std::fs::write(
+        dir.join("member/Cargo.toml"),
+        "[package]\nname = \"member\"\n",
+    )
+    .unwrap();
+    // One unchecked write — would trigger VL003 if the member manifest decided.
+    std::fs::write(
+        dir.join("member/src/lib.rs"),
+        "pub fn f(v: &mut V, a: u64) { v.x = v.x - a; }\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_vaultlint"))
+        .current_dir(dir.join("member"))
+        .args(["scan", "src", "--format", "json", "--fail-on", "never"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let findings: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap_or_default();
+    let vl003: Vec<_> = findings
+        .iter()
+        .filter(|f| f["rule_id"].as_str() == Some("VL003"))
+        .collect();
+    assert!(
+        vl003.is_empty(),
+        "expected zero VL003 findings when workspace root enables overflow-checks, got: {vl003:?}"
+    );
+}
+
 fn findings_in(directory: &str) -> Vec<(String, String, usize)> {
     let report = scan(&ScanOptions {
         root: PathBuf::from(directory),

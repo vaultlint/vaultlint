@@ -35,7 +35,7 @@ pub struct ScanReport {
 
 pub fn scan(options: &ScanOptions) -> ScanReport {
     let project = project::detect(&options.root);
-    let workspace_resolver = project::WorkspaceResolver::new();
+    let workspace_resolver = project::WorkspaceResolver::new(&options.root);
     let rules = rules::all();
     let linked_rules = rules::linked_all();
     let mut findings = Vec::new();
