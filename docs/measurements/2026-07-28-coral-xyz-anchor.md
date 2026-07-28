@@ -161,8 +161,9 @@ in the caller, and VL002 reads one function at a time. This is the exact
 limitation the README states and deliberately keeps ("helpers taking a bare
 `&AccountInfo` whose callers validate are reported … this is the shape Metaplex
 has historically been exploited through, so the findings stay"). It is a false
-positive against the program, an intended report against the function. See
-*Concerns* below — it is also the only High in the run.
+positive against the program, an intended report against the function. It is
+also the only High in the run, and therefore the sole reason the default
+`--fail-on high` fails on this corpus — see *Notes on the other four rules*.
 
 ### VL003 — overflow-checks (0 findings)
 
