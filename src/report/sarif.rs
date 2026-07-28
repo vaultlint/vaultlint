@@ -5,26 +5,33 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use crate::finding::{Finding, Severity};
+use crate::project::normalised;
 use crate::ScanReport;
 
 pub fn render(report: &ScanReport, out: &mut dyn Write) -> anyhow::Result<()> {
     let scan_root = report.scan_root.as_deref();
+    let mut run = json!({
+        "tool": {
+            "driver": {
+                "name": "vaultlint",
+                "informationUri": "https://vaultlint.com",
+                "version": crate::version(),
+                "rules": rules(report),
+            }
+        },
+        "invocations": [invocation(report)],
+        "results": report.findings.iter().map(|f| result(f, scan_root)).collect::<Vec<_>>(),
+    });
+    // Omit `originalUriBaseIds` entirely when there is no scan root (unit
+    // tests, legacy callers).  An empty object is legal per SARIF 2.1.0
+    // §3.14.14 but omitting it is cleaner.
+    if let Some(base_ids) = original_uri_base_ids(scan_root) {
+        run["originalUriBaseIds"] = base_ids;
+    }
     let document = json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
-        "runs": [{
-            "tool": {
-                "driver": {
-                    "name": "vaultlint",
-                    "informationUri": "https://vaultlint.com",
-                    "version": crate::version(),
-                    "rules": rules(report),
-                }
-            },
-            "originalUriBaseIds": original_uri_base_ids(scan_root),
-            "invocations": [invocation(report)],
-            "results": report.findings.iter().map(|f| result(f, scan_root)).collect::<Vec<_>>(),
-        }]
+        "runs": [run],
     });
     serde_json::to_writer_pretty(&mut *out, &document).map_err(std::io::Error::from)?;
     writeln!(out)?;
@@ -162,22 +169,18 @@ fn path_to_relative_uri(rel: &Path) -> String {
     rel.to_string_lossy().replace('\\', "/")
 }
 
-/// Returns `originalUriBaseIds` mapping `%SRCROOT%` to the scan root.
-/// When `scan_root` is `None` (unit tests without a real scan), omit it.
-fn original_uri_base_ids(scan_root: Option<&Path>) -> Value {
-    match scan_root {
-        None => json!({}),
-        Some(root) => {
-            let uri = path_to_file_uri(root);
-            // SARIF requires the base URI to end with `/`.
-            let uri = if uri.ends_with('/') {
-                uri
-            } else {
-                format!("{uri}/")
-            };
-            json!({ "%SRCROOT%": { "uri": uri } })
-        }
-    }
+/// Returns `originalUriBaseIds` mapping `%SRCROOT%` to the scan root, or
+/// `None` when there is no scan root (omit the key from the SARIF run).
+fn original_uri_base_ids(scan_root: Option<&Path>) -> Option<Value> {
+    let root = scan_root?;
+    let uri = path_to_file_uri(root);
+    // SARIF requires the base URI to end with `/`.
+    let uri = if uri.ends_with('/') {
+        uri
+    } else {
+        format!("{uri}/")
+    };
+    Some(json!({ "%SRCROOT%": { "uri": uri } }))
 }
 
 /// Returns the `artifactLocation` object for a finding's path.
@@ -192,15 +195,24 @@ fn artifact_location(finding_path: &Path, scan_root: Option<&Path>) -> Value {
             // Unit-test / legacy path: emit whatever string the path produces.
             json!({ "uri": finding_path.to_string_lossy().replace('\\', "/") })
         }
-        Some(root) => match finding_path.strip_prefix(root) {
-            Ok(rel) => json!({
-                "uri": path_to_relative_uri(rel),
-                "uriBaseId": "%SRCROOT%",
-            }),
-            Err(_) => json!({
-                "uri": path_to_file_uri(finding_path),
-            }),
-        },
+        Some(root) => {
+            // Normalise both sides before comparing: `scan_root` is already
+            // absolute (from `project::normalised`), but `finding.file` carries
+            // whatever spelling the scanner produced, which is relative when the
+            // user passed a relative scan root.  Without this normalisation,
+            // `strip_prefix(absolute, relative)` always fails and every in-root
+            // path falls into the `Err` branch.
+            let abs_finding = normalised(finding_path);
+            match abs_finding.strip_prefix(root) {
+                Ok(rel) => json!({
+                    "uri": path_to_relative_uri(rel),
+                    "uriBaseId": "%SRCROOT%",
+                }),
+                Err(_) => json!({
+                    "uri": path_to_file_uri(&abs_finding),
+                }),
+            }
+        }
     }
 }
 
@@ -246,5 +258,26 @@ fn level(severity: Severity) -> &'static str {
         Severity::High => "error",
         Severity::Medium => "warning",
         Severity::Low => "note",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percent_encode_path;
+
+    /// ASCII-safe characters pass through unencoded; spaces and non-ASCII
+    /// multi-byte UTF-8 sequences are percent-encoded byte by byte.
+    ///
+    /// Kill: replace the `_ => { out.push('%'); … }` branch with a no-op.
+    /// The space assertion fails because " " is not encoded.
+    #[test]
+    fn percent_encode_path_encodes_spaces_and_non_ascii() {
+        assert_eq!(percent_encode_path("/plain/path"), "/plain/path");
+        assert_eq!(
+            percent_encode_path("/path with space"),
+            "/path%20with%20space"
+        );
+        // "é" is U+00E9 → UTF-8 bytes 0xC3 0xA9 → %C3%A9
+        assert_eq!(percent_encode_path("/café"), "/caf%C3%A9");
     }
 }

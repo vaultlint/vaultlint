@@ -265,8 +265,8 @@ mod tests {
     #[test]
     fn sarif_uri_outside_scan_root_is_absolute_with_no_base_id() {
         use std::env::temp_dir;
+        // Paths are compared lexically; no filesystem state is required.
         let scan_root = temp_dir().join("vaultlint_r7_sarif_uri_abs/member/src");
-        std::fs::create_dir_all(&scan_root).unwrap();
         let workspace_manifest = temp_dir().join("vaultlint_r7_sarif_uri_abs/Cargo.toml");
 
         let mut r = ScanReport {
