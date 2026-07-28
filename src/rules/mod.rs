@@ -13,6 +13,7 @@ use crate::finding::{Finding, Severity};
 use crate::usesite::UseSiteIndex;
 
 pub trait Rule {
+    #[allow(dead_code)]
     fn id(&self) -> &'static str;
     fn check(&self, ctx: &RuleContext<'_>, out: &mut Vec<Finding>);
 }
@@ -105,15 +106,15 @@ fn finding_at(
         .trim()
         .to_string();
     Finding {
-        rule_id,
+        rule_id: std::borrow::Cow::Borrowed(rule_id),
         severity,
-        title,
+        title: std::borrow::Cow::Borrowed(title),
         message,
         file: path.to_path_buf(),
         line,
         column: start.column + 1,
         snippet,
-        help,
+        help: std::borrow::Cow::Borrowed(help),
         docs_url: format!("https://vaultlint.com/rules/{rule_id}"),
     }
 }

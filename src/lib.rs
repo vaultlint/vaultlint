@@ -1,13 +1,13 @@
 pub mod anchor;
 pub mod finding;
-pub mod parse;
-pub mod project;
+pub(crate) mod parse;
+pub(crate) mod project;
 pub mod report;
-pub mod rules;
-pub mod scan;
-pub mod scope;
-pub mod suppress;
-pub mod usesite;
+pub(crate) mod rules;
+pub(crate) mod scan;
+pub(crate) mod scope;
+pub(crate) mod suppress;
+pub(crate) mod usesite;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -16,16 +16,31 @@ use finding::Finding;
 use rules::{LinkedContext, RuleContext};
 use usesite::UseSiteIndex;
 
+/// Options controlling a single scan run.
+#[derive(Debug)]
+#[non_exhaustive]
 pub struct ScanOptions {
     pub root: PathBuf,
 }
 
-#[derive(serde::Serialize)]
+impl ScanOptions {
+    /// Create a new `ScanOptions` with the given scan root.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        ScanOptions { root: root.into() }
+    }
+}
+
+/// A file that could not be parsed and was skipped.
+#[derive(Debug, serde::Serialize)]
+#[non_exhaustive]
 pub struct SkippedFile {
     pub path: PathBuf,
     pub reason: String,
 }
 
+/// The result of a complete scan.
+#[derive(Debug)]
+#[non_exhaustive]
 pub struct ScanReport {
     pub files_scanned: usize,
     pub test_files_skipped: usize,
@@ -150,7 +165,7 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
             .cmp(&a.severity)
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.line.cmp(&b.line))
-            .then_with(|| a.rule_id.cmp(b.rule_id))
+            .then_with(|| a.rule_id.cmp(&b.rule_id))
     });
 
     ScanReport {

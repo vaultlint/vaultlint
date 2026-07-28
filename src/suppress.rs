@@ -19,7 +19,7 @@ pub fn is_suppressed(source: &str, finding: &Finding) -> bool {
 
     // Always check the finding's own line first (trailing comment).
     if let Some(line) = lines.get(index) {
-        if mentions(line, finding.rule_id) {
+        if mentions(line, &finding.rule_id) {
             return true;
         }
     }
@@ -73,7 +73,7 @@ pub fn is_suppressed(source: &str, finding: &Finding) -> bool {
             break;
         }
 
-        if mentions(line, finding.rule_id) {
+        if mentions(line, &finding.rule_id) {
             return true;
         }
 
@@ -131,15 +131,15 @@ mod tests {
 
     fn finding_with_id(rule_id: &'static str, line: usize) -> Finding {
         Finding {
-            rule_id,
+            rule_id: std::borrow::Cow::Borrowed(rule_id),
             severity: Severity::Medium,
-            title: "test finding",
+            title: std::borrow::Cow::Borrowed("test finding"),
             message: "test".to_string(),
             file: PathBuf::from("state.rs"),
             line,
             column: 1,
             snippet: String::new(),
-            help: "test help",
+            help: std::borrow::Cow::Borrowed("test help"),
             docs_url: String::new(),
         }
     }

@@ -34,6 +34,7 @@ pub struct ContextParam {
 }
 
 pub struct UseSite {
+    #[allow(dead_code)]
     pub file: PathBuf,
     pub block: syn::Block,
     pub access: FieldAccess,

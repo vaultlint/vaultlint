@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::process::Command;
 
 use vaultlint::{scan, ScanOptions};
@@ -56,9 +55,7 @@ fn relative_scan_root_sees_workspace_overflow_checks_above_cwd() {
 }
 
 fn findings_in(directory: &str) -> Vec<(String, String, usize)> {
-    let report = scan(&ScanOptions {
-        root: PathBuf::from(directory),
-    });
+    let report = scan(&ScanOptions::new(directory));
     let mut found: Vec<(String, String, usize)> = report
         .findings
         .iter()

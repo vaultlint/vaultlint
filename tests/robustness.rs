@@ -32,7 +32,7 @@ fn skipped_file_reason_contains_full_error_chain() {
     // Rust that syn cannot parse: missing function body / bad syntax.
     fs::write(&bad, "fn oops( { not valid rust at all").unwrap();
 
-    let report = scan(&ScanOptions { root: dir });
+    let report = scan(&ScanOptions::new(dir));
 
     assert_eq!(report.skipped.len(), 1, "expected one skipped file");
     let reason = &report.skipped[0].reason;

@@ -97,7 +97,7 @@ fn main() -> ExitCode {
     let scan_thread = std::thread::Builder::new()
         .name("vaultlint-scan".into())
         .stack_size(64 << 20) // 64 MiB
-        .spawn(move || scan(&ScanOptions { root: path }));
+        .spawn(move || scan(&ScanOptions::new(path)));
 
     let report_data = match scan_thread {
         Err(e) => {

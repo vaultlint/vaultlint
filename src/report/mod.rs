@@ -62,19 +62,20 @@ mod tests {
     use super::*;
     use crate::finding::{Finding, Severity};
     use crate::{ScanReport, SkippedFile};
+    use std::borrow::Cow;
     use std::path::PathBuf;
 
     fn finding(severity: Severity) -> Finding {
         Finding {
-            rule_id: "VL002",
+            rule_id: Cow::Borrowed("VL002"),
             severity,
-            title: "missing owner check",
+            title: Cow::Borrowed("missing owner check"),
             message: "`vault` is deserialised without an owner check.".to_string(),
             file: PathBuf::from("programs/staking/src/withdraw.rs"),
             line: 42,
             column: 9,
             snippet: "pub authority: AccountInfo<'info>,".to_string(),
-            help: "Use `Account<'info, T>`, which checks the owner.",
+            help: Cow::Borrowed("Use `Account<'info, T>`, which checks the owner."),
             docs_url: "https://vaultlint.com/rules/VL002".to_string(),
         }
     }
@@ -234,15 +235,15 @@ mod tests {
             test_files_skipped: 0,
             anchor_version: None,
             findings: vec![Finding {
-                rule_id: "VL002",
+                rule_id: Cow::Borrowed("VL002"),
                 severity: Severity::High,
-                title: "missing owner check",
+                title: Cow::Borrowed("missing owner check"),
                 message: "test".to_string(),
                 file: scan_root.join("src/lib.rs"),
                 line: 1,
                 column: 1,
                 snippet: String::new(),
-                help: "fix it",
+                help: Cow::Borrowed("fix it"),
                 docs_url: "https://vaultlint.com/rules/VL002".to_string(),
             }],
             skipped: vec![],
@@ -274,15 +275,15 @@ mod tests {
             test_files_skipped: 0,
             anchor_version: None,
             findings: vec![Finding {
-                rule_id: "VL003",
+                rule_id: Cow::Borrowed("VL003"),
                 severity: Severity::Medium,
-                title: "overflow-checks is not enabled",
+                title: Cow::Borrowed("overflow-checks is not enabled"),
                 message: "test".to_string(),
                 file: workspace_manifest.clone(),
                 line: 1,
                 column: 1,
                 snippet: String::new(),
-                help: "fix it",
+                help: Cow::Borrowed("fix it"),
                 docs_url: "https://vaultlint.com/rules/VL003".to_string(),
             }],
             skipped: vec![],
@@ -313,27 +314,27 @@ mod tests {
     #[test]
     fn sarif_vl003_descriptor_is_stable_regardless_of_finding_order() {
         let low_finding = Finding {
-            rule_id: "VL003",
+            rule_id: Cow::Borrowed("VL003"),
             severity: Severity::Low,
-            title: "unchecked arithmetic",
+            title: Cow::Borrowed("unchecked arithmetic"),
             message: "op".to_string(),
             file: PathBuf::from("src/lib.rs"),
             line: 3,
             column: 1,
             snippet: String::new(),
-            help: "use checked_add",
+            help: Cow::Borrowed("use checked_add"),
             docs_url: "https://vaultlint.com/rules/VL003".to_string(),
         };
         let medium_finding = Finding {
-            rule_id: "VL003",
+            rule_id: Cow::Borrowed("VL003"),
             severity: Severity::Medium,
-            title: "overflow-checks is not enabled",
+            title: Cow::Borrowed("overflow-checks is not enabled"),
             message: "workspace".to_string(),
             file: PathBuf::from("Cargo.toml"),
             line: 1,
             column: 1,
             snippet: String::new(),
-            help: "add overflow-checks = true",
+            help: Cow::Borrowed("add overflow-checks = true"),
             docs_url: "https://vaultlint.com/rules/VL003".to_string(),
         };
 

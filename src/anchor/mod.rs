@@ -1,12 +1,14 @@
-pub mod attr;
+pub(crate) mod attr;
 
 use proc_macro2::Span;
 use syn::spanned::Spanned;
 
+#[derive(Debug)]
 pub struct AnchorModel {
     pub accounts_structs: Vec<AccountsStruct>,
 }
 
+#[derive(Debug)]
 pub struct AccountsStruct {
     pub name: String,
     /// Argument names declared in `#[instruction(name: Type, …)]` on the struct.
@@ -14,11 +16,12 @@ pub struct AccountsStruct {
     pub fields: Vec<AccountField>,
 }
 
+#[derive(Debug)]
 pub struct AccountField {
     pub name: String,
     pub ty: AccountTy,
     pub constraints: Vec<Constraint>,
-    pub span: Span,
+    pub(crate) span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -53,7 +53,7 @@ struct RuleDescriptor {
 }
 
 /// Returns static metadata for each rule ID.
-fn rule_metadata(rule_id: &'static str) -> RuleDescriptor {
+fn rule_metadata(rule_id: &str) -> RuleDescriptor {
     match rule_id {
         "VL001" => RuleDescriptor {
             name: "unproven authority on init",
@@ -98,8 +98,8 @@ fn rules(report: &ScanReport) -> Vec<Value> {
     let mut seen: BTreeMap<&str, ()> = BTreeMap::new();
     let mut result = Vec::new();
     for finding in &report.findings {
-        if seen.insert(finding.rule_id, ()).is_none() {
-            let meta = rule_metadata(finding.rule_id);
+        if seen.insert(&finding.rule_id, ()).is_none() {
+            let meta = rule_metadata(&finding.rule_id);
             result.push(json!({
                 "id": finding.rule_id,
                 "name": meta.name,

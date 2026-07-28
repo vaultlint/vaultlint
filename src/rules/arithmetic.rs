@@ -113,9 +113,9 @@ pub fn overflow_checks_finding(manifest: &Path) -> Finding {
         .trim()
         .to_string();
     Finding {
-        rule_id: "VL003",
+        rule_id: std::borrow::Cow::Borrowed("VL003"),
         severity: Severity::Medium,
-        title: "overflow-checks is not enabled",
+        title: std::borrow::Cow::Borrowed("overflow-checks is not enabled"),
         message: "This workspace does not set `overflow-checks = true` under \
                   `[profile.release]`. Solana programs are built in release mode, so \
                   arithmetic that overflows wraps silently instead of aborting the \
@@ -125,9 +125,11 @@ pub fn overflow_checks_finding(manifest: &Path) -> Finding {
         line,
         column: 1,
         snippet,
-        help: "Add `[profile.release]` with `overflow-checks = true` to the workspace \
-               manifest. Overflow then aborts the transaction instead of writing a wrapped \
-               value.",
+        help: std::borrow::Cow::Borrowed(
+            "Add `[profile.release]` with `overflow-checks = true` to the workspace \
+             manifest. Overflow then aborts the transaction instead of writing a wrapped \
+             value.",
+        ),
         docs_url: "https://vaultlint.com/rules/VL003".to_string(),
     }
 }
