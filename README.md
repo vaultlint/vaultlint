@@ -34,11 +34,6 @@ $ vaultlint scan ./examples/vulnerable
         Account data is deserialised without verifying the account owner. An attacker can pass a look-alike account owned by another program.
         Use `Account<'info, T>`, which checks the owner and discriminator, or add `require_keys_eq!(*account.owner, crate::ID)` before reading.
 
-⚠ MED  unproven authority on initialization
-        ./examples/vulnerable/unproven_authority.rs:27
-        `authority` is an unvalidated account whose key is baked into the seeds of `user_account`, initialised by this instruction, and read by the handler. Nothing proves the account authorised this, so anyone can create `user_account` naming an arbitrary `authority`.
-        Declare the field as `Signer<'info>` if it must authorise the instruction, or bind it to an account whose authority was already proven (`has_one = ...`, `constraint = ...`). If the permissionless designation is intended, suppress the finding.
-
 ⚠ MED  non-canonical PDA bump
         ./examples/vulnerable/pda_bump.rs:7
         `vault` uses `bump = user_bump`, where `user_bump` is an `#[instruction]` argument. An attacker controls this value and can pass a non-canonical bump to address a different account.
@@ -46,20 +41,30 @@ $ vaultlint scan ./examples/vulnerable
 
 ⚠ MED  unchecked CPI to unknown program
         ./examples/vulnerable/unchecked_cpi.rs:10
-        This cross-program invocation runs without verifying the callee's program id. An attacker who controls that account can point it at their own program.
+        `*ctx.accounts.target_program.key` supplies the program id for this CPI, and nothing in the handler proves which program it is. An attacker who controls that account can point the invocation at their own program.
         Use Anchor's typed CPI helpers, or verify the id first, e.g. `require_keys_eq!(program.key(), expected::ID)`.
 
-⚠ MED  unchecked arithmetic
+⚠ MED  unproven authority on initialization
+        ./examples/vulnerable/unproven_authority.rs:27
+        `authority` is an unvalidated account whose key is baked into the seeds of `user_account`, initialised by this instruction, and read by the handler. Nothing proves the account authorised this, so anyone can create `user_account` naming an arbitrary `authority`.
+        Declare the field as `Signer<'info>` if it must authorise the instruction, or bind it to an account whose authority was already proven (`has_one = ...`, `constraint = ...`). If the permissionless designation is intended, suppress the finding.
+
+⚠ MED  overflow-checks is not enabled
+        Cargo.toml:1
+        This workspace does not set `overflow-checks = true` under `[profile.release]`. Solana programs are built in release mode, so arithmetic that overflows wraps silently instead of aborting the transaction.
+        Add `[profile.release]` with `overflow-checks = true` to the workspace manifest. Overflow then aborts the transaction instead of writing a wrapped value.
+
+⚠ LOW  unchecked arithmetic
         ./examples/vulnerable/unchecked_math.rs:4
-        Unchecked subtraction writes into account state. Solana programs are built in release mode, where overflow wraps silently.
-        Use `checked_add` / `checked_sub` / `checked_mul` and handle the `None` case.
+        Unchecked subtraction writes into a struct field, and this workspace does not enable `overflow-checks`, so an overflow wraps silently instead of aborting the transaction.
+        Enable `overflow-checks` for the release profile, or use `checked_add` / `checked_sub` / `checked_mul` and handle the `None` case.
 
-⚠ MED  unchecked arithmetic
+⚠ LOW  unchecked arithmetic
         ./examples/vulnerable/unchecked_math.rs:5
-        Unchecked addition writes into account state. Solana programs are built in release mode, where overflow wraps silently.
-        Use `checked_add` / `checked_sub` / `checked_mul` and handle the `None` case.
+        Unchecked addition writes into a struct field, and this workspace does not enable `overflow-checks`, so an overflow wraps silently instead of aborting the transaction.
+        Enable `overflow-checks` for the release profile, or use `checked_add` / `checked_sub` / `checked_mul` and handle the `None` case.
 
-6 issues found · 1 high · 5 medium
+7 issues found · 1 high · 4 medium · 2 low
 ```
 
 Exit codes make it CI-ready: `0` when nothing exceeds the threshold, `1` when it does,
@@ -72,7 +77,7 @@ Exit codes make it CI-ready: `0` when nothing exceeds the threshold, `1` when it
 |----|----------|-----------------|
 | [VL001](https://vaultlint.com/rules/VL001) | Medium | An unvalidated authority baked into the seeds of an account this instruction creates, and written into it |
 | [VL002](https://vaultlint.com/rules/VL002) | High | Raw account data deserialised with nothing proving which program owns the account |
-| [VL003](https://vaultlint.com/rules/VL003) | Medium | Unchecked `+ - *` written into account state |
+| [VL003](https://vaultlint.com/rules/VL003) | Medium | A workspace that does not enable `overflow-checks`, and the arithmetic that then wraps silently |
 | [VL004](https://vaultlint.com/rules/VL004) | Medium | PDAs validated with a caller-supplied bump (`bump = <instruction arg>`) |
 | [VL005](https://vaultlint.com/rules/VL005) | Medium | A CPI whose program id comes from an account the caller controls |
 
@@ -119,6 +124,27 @@ macro, or a helper like `assert_owned_by`. It also does not flag the method form
 What it still misses: helpers taking a bare `&AccountInfo` whose callers validate are
 reported, because a rule that reads one function at a time cannot see the caller — this
 is the shape Metaplex has historically been exploited through, so the findings stay.
+
+**VL003 is a question about your build profile, asked once.** With
+`[profile.release] overflow-checks = true` an overflow panics: the transaction aborts
+and no funds move. Solana programs are built in release mode, so that one line switches
+off the whole silent-wrap bug class, and it is the only actionable thing there is to
+say. Reporting it per call site was measured and abandoned — 382 findings across twelve
+production codebases, not one of them worth acting on. VL003 now asks the question once,
+at the manifest Cargo actually reads `[profile.release]` from, and is completely silent
+on a workspace that already sets the flag. Where it is missing, the arithmetic sites are
+still listed, at Low, as evidence of what would wrap. The same twelve codebases now give
+26 findings across 24 workspace roots, 22 of which say nothing at all.
+
+Which manifest counts is not a detail. Cargo ignores `[profile.*]` in every manifest that
+is not the workspace root, so a member crate setting the flag changes nothing about how
+it is built — and a linter that read the nearest manifest would congratulate you for a
+line that has no effect. vaultlint resolves the root the way Cargo does: the nearest
+ancestor manifest declaring `[workspace]`, honouring an explicit `package.workspace`
+pointer and the `workspace.exclude` list. `workspace.members` globs are not matched,
+because a manifest declaring `[workspace]` without listing a package below it makes Cargo
+itself refuse to build. Suppressing the arithmetic sites suppresses the question too: the
+workspace-level finding appears only where at least one unsuppressed site remains.
 
 **VL005 does not flag every unverified `invoke`.** It flags a CPI whose `Instruction`
 was built in that same function body and whose `program_id` came from an account —
