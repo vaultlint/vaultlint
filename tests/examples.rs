@@ -40,7 +40,11 @@ fn relative_scan_root_sees_workspace_overflow_checks_above_cwd() {
         .unwrap();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let findings: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap_or_default();
+    let response: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("failed to parse JSON output: {}", stdout));
+    let findings = response["findings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("response must have 'findings' array, got: {}", response));
     let vl003: Vec<_> = findings
         .iter()
         .filter(|f| f["rule_id"].as_str() == Some("VL003"))
