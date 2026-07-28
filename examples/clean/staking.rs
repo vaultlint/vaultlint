@@ -9,10 +9,11 @@
 //            `require_keys_eq!` before the deserialiser call.
 //   VL003 — all arithmetic into struct fields uses `checked_add` / `checked_sub`;
 //            no plain `+` / `-` / `*` on the left-hand side of a field write.
-//   VL004 — `#[account(seeds = …, bump)]` without `bump = <instruction_arg>`;
-//            `bump` alone tells Anchor to derive the canonical bump itself.
-//            `find_program_address` (canonical) is used in the body, not
-//            `create_program_address`.
+//   VL004 — `#[instruction(amount: u64)]` is present on `Withdraw` so `amount`
+//            is in the instruction-arg set. `bump = vault.bump` is a field access,
+//            not a bare identifier, so the guard correctly ignores it.
+//            `find_program_address` (canonical) is called in the body;
+//            `create_program_address` is not used.
 //   VL005 — `invoke` is called, but the instruction's `program_id` comes from a
 //            `Program<'info, System>`-typed field, which Anchor has already
 //            verified. `require_keys_eq!` is also present for explicitness.
@@ -38,12 +39,20 @@ pub mod staking {
 
     /// VL002: raw bytes are deserialised after an explicit owner check.
     /// VL003: checked_sub — no silent overflow.
+    /// VL004: `amount` is an instruction arg (see #[instruction] on Withdraw), but
+    ///        `bump = vault.bump` is a field access, not a bare identifier, so the
+    ///        guard correctly ignores it. `find_program_address` is used here
+    ///        (canonical), not `create_program_address`.
     pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
         let config_account = &ctx.accounts.config;
         // Owner verified before deserialisation — VL002 is silent.
         require_keys_eq!(*config_account.owner, crate::ID);
         let config = Config::try_from_slice(&config_account.data.borrow())?;
         let vault = &mut ctx.accounts.vault;
+        // Canonical derivation — find_program_address always returns the highest
+        // (canonical) bump, so VL004's DerivationVisitor does not flag it.
+        let seeds: &[&[u8]] = &[b"vault", ctx.accounts.authority.key.as_ref()];
+        let (_pda, _bump) = Pubkey::find_program_address(seeds, ctx.program_id);
         // Checked arithmetic — VL003 is silent.
         vault.balance = vault
             .balance
@@ -88,7 +97,15 @@ pub struct Initialize<'info> {
     pub system_program: Program<'info, System>,
 }
 
+// `#[instruction(amount: u64)]` is required so that `amount` appears in the
+// instruction-arg set. The rule then evaluates `bump = vault.bump`: `vault.bump`
+// is a field access (contains a `.`), so `is_bare_identifier` returns false and
+// the rule is silent. Removing `#[instruction(...)]` makes `amount` absent from
+// the arg set so the guard cannot evaluate — the canary goes silent by
+// construction. Changing `bump = vault.bump` to `bump = amount` makes the rule
+// fire (bare identifier AND in instruction args).
 #[derive(Accounts)]
+#[instruction(amount: u64)]
 pub struct Withdraw<'info> {
     #[account(
         mut,

@@ -256,7 +256,7 @@ fn json_format_reports_unparseable_file_in_skipped_array() {
     );
     // The reason must identify what went wrong (contains parsing error context).
     assert!(
-        reason.contains("parsing") || reason.len() > 10,
+        reason.contains("parsing"),
         "reason must describe the parse failure; got: {reason:?}"
     );
 

@@ -131,8 +131,11 @@ mod tests {
     /// first assertion fails.
     ///
     /// Kill (floor boundary): change `FailOn::High => Some(Severity::High)` to
-    /// `FailOn::High => None`. Then `exit_code(&low_report, FailOn::High)` returns 1
-    /// instead of 0 and the second assertion fails.
+    /// `FailOn::High => Some(Severity::Low)`. Then the threshold drops to Low,
+    /// `exit_code(&low_report, FailOn::High)` returns 1 instead of 0, and the
+    /// third assertion fails. (`FailOn::High => None` does not work as a kill:
+    /// `None` short-circuits `exit_code` to 0, which is exactly what the
+    /// assertion expects.)
     #[test]
     fn fail_on_low_triggers_on_a_low_severity_finding() {
         let low_report = report(vec![finding(Severity::Low)]);
