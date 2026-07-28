@@ -11,6 +11,7 @@ readme = "README.md"
 keywords = ["solana", "anchor", "security", "linter", "static-analysis"]
 categories = ["development-tools"]
 autoexamples = false
+exclude = [".superpowers/", ".github/"]
 
 [dependencies]
 anyhow = "1"

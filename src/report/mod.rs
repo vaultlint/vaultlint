@@ -6,6 +6,7 @@ use crate::finding::Severity;
 use crate::ScanReport;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Format {
     Human,
     Json,
@@ -27,6 +28,7 @@ pub fn render(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FailOn {
     High,
     Medium,
