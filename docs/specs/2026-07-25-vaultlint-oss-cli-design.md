@@ -74,27 +74,50 @@ code/
 ### Модель находки
 
 ```rust
+#[non_exhaustive]
 struct Finding {
-    rule_id: &'static str,      // "VL001"
+    rule_id: Cow<'static, str>, // "VL001"
     severity: Severity,         // High | Medium | Low
-    title: &'static str,        // "unproven authority on initialization"
+    title: Cow<'static, str>,   // "unproven authority on initialization"
     message: String,            // конкретика с именем аккаунта/выражения
     file: PathBuf,
     line: usize,
     column: usize,              // best-effort
     snippet: String,            // строка исходника
-    help: &'static str,         // как чинить
+    help: Cow<'static, str>,    // как чинить
     docs_url: String,           // https://vaultlint.com/rules/VL001
 }
 ```
+
+Поля `rule_id`, `title` и `help` — `Cow<'static, str>` вместо `&'static str`. Причина:
+крейт выводит `Deserialize` для `Finding`, чтобы потребитель мог прочитать собственный JSON
+vaultlint его же типами. `serde` не умеет десериализовать в `&'static str`, поскольку
+десериализованное значение живёт дольше, чем любая статически известная строка. `Cow` сохраняет
+нулевое размещение при внутреннем построении (`Cow::Borrowed` на строковом литерале) и допускает
+`Cow::Owned` при десериализации.
+
+`Finding`, `ScanReport`, `ScanOptions` и `SkippedFile` помечены `#[non_exhaustive]`: добавление
+поля в будущих версиях не ломает semver. Следствие для `ScanOptions`: внешний код не может
+строить его через struct-literal (атрибут `#[non_exhaustive]` запрещает это вне крейта), поэтому
+добавлен конструктор `ScanOptions::new(root: impl Into<PathBuf>)`.
 
 Номер строки — основной якорь находки; колонка отображается по возможности.
 `docs_url` ведёт на страницу правила на сайте: правила гонят трафик на контент.
 
 ### API правила
 
+Модуль `rules` — `pub(crate)`. `RuleContext`, `Rule` и `LinkedRule` не являются частью публичного
+API крейта: возможность писать сторонние правила в 0.1.0 намеренно не поддерживается. Добавление
+нового правила требует изменения самого крейта. Причина: каждый публичный элемент, вышедший в
+0.1.0, — это обязательство, которое нельзя отозвать, не подняв мажорную версию. Стабилизировать
+интерфейс расширения до того, как он испытан хотя бы на пяти правилах, значит заморозить
+преждевременное решение.
+
+Внутреннее устройство для справки:
+
 ```rust
-pub struct RuleContext<'a> {
+// pub(crate)
+struct RuleContext<'a> {
     path: &'a Path,
     source: &'a str,
     ast: &'a syn::File,
@@ -102,15 +125,13 @@ pub struct RuleContext<'a> {
     overflow_checks: bool,
 }
 
-pub trait Rule {
-    fn id(&self) -> &'static str;
-    fn severity(&self) -> Severity;
+// pub(crate)
+trait Rule {
     fn check(&self, ctx: &RuleContext<'_>, out: &mut Vec<Finding>);
 }
 ```
 
-Правило ничего не знает про обход файлов и форматы вывода. Добавление правила — новый файл
-в `rules/` и одна строка в реестре.
+Правило ничего не знает про обход файлов и форматы вывода.
 
 `overflow_checks` — не общескановое значение, а свойство конкретного файла: сканер резолвит
 для каждого файла корень его воркспейса (см. VL003) и кладёт в контекст флаг именно этого
@@ -121,21 +142,42 @@ pub trait Rule {
 Единственное место в коде, знающее синтаксис Anchor. Строится за один проход по файлу,
 тестируется отдельно от правил.
 
+Модуль `anchor` — `pub(crate)`. Типы `AnchorModel`, `AccountsStruct`, `AccountField`,
+`AccountTy` и `Constraint` не входят в публичный API: они слишком тесно связаны с форматом
+атрибутов Anchor, и их форма будет меняться по мере расширения набора правил.
+
+Внутреннее устройство для справки:
+
 ```rust
+// pub(crate)
 struct AnchorModel { accounts_structs: Vec<AccountsStruct> }
 
-struct AccountsStruct { name: String, fields: Vec<AccountField>, span: Span }
+// pub(crate)
+struct AccountsStruct {
+    name: String,
+    instruction_args: Vec<String>,  // имена аргументов из #[instruction(...)]
+    fields: Vec<AccountField>,
+}
 
+// pub(crate)
 struct AccountField {
     name: String,
     ty: AccountTy,
     constraints: Vec<Constraint>,
-    span: Span,
+    span: Span,  // pub(crate), используется правилами для позиции находки
 }
 
-enum AccountTy { Signer, Account(String), AccountInfo, UncheckedAccount, Program, Other(String) }
+// pub(crate)
+enum AccountTy {
+    Signer, Account(String), AccountInfo, UncheckedAccount,
+    Program, SystemAccount, Sysvar, Other(String)
+}
 
-enum Constraint { Init, Seeds(TokenStream), Bump(Option<Expr>), HasOne(Ident), Mut, Custom(Expr) }
+// pub(crate)
+enum Constraint {
+    Init, Mut, Seeds(String), Bump(Option<String>),
+    HasOne(String), Custom(String), Other(String, String)
+}
 ```
 
 Ключевое различение: `Bump(None)` — голый `bump` (пересчёт), `Bump(Some(expr))` — `bump = expr`
@@ -879,16 +921,39 @@ mango).
 
 ## Публичный API библиотеки
 
-Крейт публикуется на crates.io, поэтому всё `pub` — это обязательство по semver.
+Крейт публикуется на crates.io, поэтому всё `pub` — это обязательство по semver. Номер версии
+нельзя переиздать: каждый публичный элемент в 0.1.0 — это обязательство, от которого нельзя
+отступить, не подняв мажорную версию.
 
-- Внутренние помощники разбора (`anchor::attr`) не публичны.
-- Типы `syn` и `proc-macro2` не торчат в публичных сигнатурах. Иначе выход `syn 3` становится
-  ломающим изменением vaultlint, даже если сам vaultlint не менялся.
+**Поддерживаемая публичная поверхность 0.1.0:** функция `scan()`, возвращающая `ScanReport`;
+типы `Finding` и `Severity`, читаемые из него; рендереры в `report`. Всё остальное — внутреннее.
+
+- **Модуль `anchor` — `pub(crate)`.** `AnchorModel`, `AccountsStruct`, `AccountField`,
+  `AccountTy` и `Constraint` недоступны снаружи крейта. Модель строится под конкретный набор
+  правил и будет меняться по мере их расширения.
+- **Модуль `rules` — `pub(crate)`.** `RuleContext`, `Rule` и `LinkedRule` недоступны снаружи
+  крейта. Создание сторонних правил в 0.1.0 намеренно не является поддерживаемой возможностью.
+- Типы `syn` и `proc-macro2` не торчат в публичных сигнатурах. Это закрытый риск: ранее выход
+  `syn 3` стал бы ломающим изменением vaultlint, даже если сам vaultlint не менялся. Сейчас оба
+  крейта используются только в `pub(crate)`-модулях, и это проверено компиляцией внешнего крейта
+  против vaultlint: ни `syn`, ни `proc-macro2` не утекают в публичные сигнатуры.
 - `ScanOptions`, `ScanReport`, `Finding`, `SkippedFile` помечены `#[non_exhaustive]`: они точно
   будут расти (выбор правил, exclude-маски, per-file `overflow-checks`), и добавление поля не
-  должно ломать мажорную версию.
+  должно ломать мажорную версию. `ScanOptions::new(root)` — единственный способ создать
+  `ScanOptions` снаружи крейта, поскольку `#[non_exhaustive]` запрещает struct-literal
+  конструирование во внешнем коде.
 - `Finding` и `Severity` умеют не только `Serialize`, но и `Deserialize` — иначе потребитель не
   может прочитать собственный JSON vaultlint его же типами.
+- `Severity` реализует `Display` (строки `"low"` / `"medium"` / `"high"`, те же, что у `serde`)
+  и `FromStr` с тем же набором строк — пара образует полный round-trip. Метод `label()`, дающий
+  форму `LOW`/`MED`/`HIGH` для терминального вывода, — `pub(crate)`: две конкурирующие публичные
+  текстовые репрезентации одного типа — ловушка для потребителей.
+- Публичные рендереры (`report::render`, `report::human::render`, `report::json::render`,
+  `report::sarif::render`) возвращают `std::io::Result<()>`, а не `anyhow::Result<()>`: так в
+  API не проникает сторонний тип ошибок. Ошибки `serde_json` при записи JSON конвертируются через
+  `std::io::Error::from` — эта конверсия принципиальна: `serde_json::Error::source()` возвращает
+  `None`, и без неё обрыв пайпа (`vaultlint scan . | head`) не опознаётся как broken pipe и
+  завершается кодом выхода 2 вместо 0.
 
 ## Страницы правил на сайте
 
@@ -908,6 +973,12 @@ mango).
   структуры. VL001 — единственное исключение: он смотрит в тело хендлера на один вызов вглубь
   через индекс использований, потому что без этого сужение до реальной формы бага невозможно.
   Глубже одного вызова анализ не идёт и в перспективе относится к платному LLM-слою.
+- **~~Мажорный релиз `syn` ломает vaultlint.~~** _(Закрыто в R8.)_ До R8 типы `syn` и
+  `proc-macro2` присутствовали в публичных сигнатурах, и выход `syn 3` был бы ломающим
+  изменением semver для vaultlint, даже если сам vaultlint не менялся. Закрыто переводом всех
+  модулей, использующих эти типы, в `pub(crate)`: модули `anchor`, `rules`, `parse`, `scope` и
+  остальные внутренние модули недоступны снаружи крейта. Проверено компиляцией внешнего крейта
+  против vaultlint: ни `syn`, ни `proc-macro2` не появляются в публичных сигнатурах.
 - **Объём работы.** Детерминированный движок — это недели фокуса, а не выходные. Срезы нужны
   именно для того, чтобы каждая неделя заканчивалась рабочим инструментом.
 
