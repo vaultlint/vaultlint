@@ -1,15 +1,14 @@
-/// Robustness tests for task R6.
-///
-/// Three behaviours under test:
-///   1. Error chain: a skipped file's reason carries both the outer
-///      "parsing <path>" context and the inner syn error.
-///   2. Deep nesting: a file with hundreds of nested blocks (enough to
-///      overflow the default main-thread stack) is handled gracefully
-///      rather than crashing with SIGABRT.
-///   3. Broken pipe: piping the output into `head` exits 0 with nothing
-///      on stderr.
+//! Robustness tests for task R6.
+//!
+//! Three behaviours under test:
+//!   1. Error chain: a skipped file's reason carries both the outer
+//!      "parsing <path>" context and the inner syn error.
+//!   2. Deep nesting: a file with hundreds of nested blocks (enough to
+//!      overflow the default main-thread stack) is handled gracefully
+//!      rather than crashing with SIGABRT.
+//!   3. Broken pipe: piping the output into `head` exits 0 with nothing
+//!      on stderr.
 use std::fs;
-use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
@@ -70,24 +69,29 @@ fn write_deep_file(dir: &Path, depth: usize) {
     fs::write(dir.join("deep.rs"), source).unwrap();
 }
 
-/// A file with deeply-nested blocks (500 levels, well above the ~380-level
-/// default-stack overflow threshold measured empirically) must be handled
-/// gracefully: the binary either skips the file or scans it, and exits with
-/// code 0 or 1, never with a signal (exit code 134 / SIGABRT).
+/// A file with deeply-nested blocks must be handled gracefully: the binary
+/// either skips the file or scans it, and exits with code 0 or 1, never with
+/// a signal (exit code 134 / SIGABRT).
 ///
-/// Empirically measured:
-///   - Overflow threshold on the default main-thread stack: 380 nested blocks.
-///   - Test fixture depth: 500 nested blocks (comfortably above the threshold).
+/// Measured on this machine (macOS, Apple Silicon):
+///   - Default-stack overflow threshold, dev   profile: 380 nested blocks
+///   - Default-stack overflow threshold, release profile: 1619 nested blocks
+///   - 64 MiB-stack overflow threshold, dev   profile: 3065 nested blocks
+///   - 64 MiB-stack overflow threshold, release profile: 13027 nested blocks
+///
+/// DEPTH = 2200 sits above both default-stack thresholds with >25% headroom
+/// and below both 64 MiB thresholds with >25% headroom in both profiles.
 ///
 /// Kill: remove the `thread::Builder::new().stack_size(64 << 20).spawn(…)` call
 /// from `src/main.rs` and restore the direct `scan(…)` call on the main thread.
 /// The binary then exits with code 134 (SIGABRT) instead of 0/1, and the
-/// assertion `code != 134` fails.
+/// assertion `code != 134` fails — in both dev and release.
 #[test]
 fn deep_nesting_does_not_crash_the_binary() {
-    // Empirical overflow threshold: 380 nested blocks on the default stack.
-    // Test fixture uses 500 to be comfortably above it.
-    const DEPTH: usize = 500;
+    // DEPTH sits above both default-stack overflow thresholds (380 dev, 1619
+    // release) and below both 64 MiB thresholds (3065 dev, 13027 release),
+    // each with at least 25% headroom on both sides in both profiles.
+    const DEPTH: usize = 2200;
 
     let dir = std::env::temp_dir().join("vaultlint_r6_deep_nesting");
     let _ = fs::remove_dir_all(&dir);
@@ -110,11 +114,8 @@ fn deep_nesting_does_not_crash_the_binary() {
         Some(134),
         "exit code 134 means SIGABRT — the scan thread still overflowed"
     );
-    // The tool must exit cleanly: 0 (no findings or skipped) or 1 (findings).
-    assert!(
-        code == Some(0) || code == Some(1),
-        "expected exit code 0 or 1, got: {code:?}"
-    );
+    // With --fail-on never and no security findings in the fixture, exit 0.
+    assert_eq!(code, Some(0), "expected exit code 0, got: {code:?}");
 }
 
 // ── 3. Broken pipe ────────────────────────────────────────────────────────────
@@ -148,7 +149,7 @@ fn broken_pipe_exits_zero_with_no_stderr() {
             "scan",
             dir.to_str().unwrap(),
             "--fail-on",
-            "never",
+            "medium",
             "--format",
             "human",
         ])
@@ -174,65 +175,5 @@ fn broken_pipe_exits_zero_with_no_stderr() {
     assert!(
         stderr.is_empty(),
         "broken pipe must produce no stderr output, got: {stderr:?}"
-    );
-}
-
-// ── Negative test: non-broken-pipe write errors still exit 2 ─────────────────
-
-/// A render error that is NOT a broken pipe must still exit 2 with a message
-/// on stderr. We cannot easily inject a real non-BrokenPipe write error from
-/// outside the binary, so we test the library's render path directly: writing
-/// into a sink that fails with `PermissionDenied` must propagate the error.
-///
-/// This test is a library-level unit test — it validates that the broken-pipe
-/// detection is genuinely conditional on the error kind rather than always
-/// silencing errors.
-///
-/// Kill: change the `is_broken_pipe` branch in `src/main.rs` to `true`
-/// unconditionally. This test cannot catch that kill (it drives the library,
-/// not the binary), but the integration test below can.
-#[test]
-fn non_broken_pipe_render_error_is_propagated() {
-    struct FailWriter;
-    impl Write for FailWriter {
-        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "simulated failure",
-            ))
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    // A minimal scan report to render.
-    let report = vaultlint::ScanReport {
-        files_scanned: 0,
-        test_files_skipped: 0,
-        anchor_version: None,
-        findings: vec![],
-        skipped: vec![],
-    };
-    let result = vaultlint::report::render(
-        &report,
-        vaultlint::report::Format::Human,
-        &mut FailWriter,
-        false,
-    );
-
-    assert!(
-        result.is_err(),
-        "render into a failing writer must return Err"
-    );
-    let err = result.unwrap_err();
-    // The error is NOT a broken pipe, so the binary path would NOT silence it.
-    let is_broken_pipe = err
-        .chain()
-        .find_map(|e| e.downcast_ref::<std::io::Error>())
-        .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe);
-    assert!(
-        !is_broken_pipe,
-        "PermissionDenied must not be classified as broken pipe"
     );
 }

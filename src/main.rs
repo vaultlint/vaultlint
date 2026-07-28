@@ -67,6 +67,15 @@ impl From<FormatArg> for Format {
     }
 }
 
+// serde_json::Error does not expose its inner io::Error via source(), so callers
+// in json.rs and sarif.rs must convert through std::io::Error::from first.
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|e| e.downcast_ref::<std::io::Error>())
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let Command::Scan {
@@ -83,6 +92,8 @@ fn main() -> ExitCode {
     // Run the scan on a thread with a large stack so that deeply nested
     // Rust code (e.g. generated code with hundreds of nested blocks) does
     // not overflow the default main-thread stack.
+    // proc-macro2's SOURCE_MAP is thread-local, so span resolution must happen
+    // inside this thread — do not call span.start() after join().
     let scan_thread = std::thread::Builder::new()
         .name("vaultlint-scan".into())
         .stack_size(64 << 20) // 64 MiB
@@ -109,13 +120,7 @@ fn main() -> ExitCode {
         // A broken pipe (e.g. `vaultlint scan . | head`) is not a tool error.
         // Exit 0 and print nothing; the truncated output cannot carry a
         // trustworthy pass/fail signal anyway.
-        let is_broken_pipe = error
-            .chain()
-            .find_map(|e| e.downcast_ref::<std::io::Error>())
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe);
-
-        if is_broken_pipe {
-            // Flush stdout before exiting; ignore any further pipe errors.
+        if is_broken_pipe(&error) {
             let _ = stdout.flush();
             return ExitCode::SUCCESS;
         }
@@ -125,4 +130,47 @@ fn main() -> ExitCode {
     }
 
     ExitCode::from(report::exit_code(&report_data, fail_on.into()) as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_broken_pipe;
+
+    #[test]
+    fn broken_pipe_io_error_is_detected() {
+        let io_err = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        let err = anyhow::Error::from(io_err);
+        assert!(is_broken_pipe(&err));
+    }
+
+    #[test]
+    fn broken_pipe_through_anyhow_context_is_detected() {
+        let io_err = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        let err = anyhow::Error::from(io_err).context("writing report");
+        assert!(is_broken_pipe(&err));
+    }
+
+    #[test]
+    fn other_io_error_is_not_classified_as_broken_pipe() {
+        let io_err = std::io::Error::from(std::io::ErrorKind::Other);
+        let err = anyhow::Error::from(io_err).context("writing report");
+        assert!(!is_broken_pipe(&err));
+    }
+
+    #[test]
+    fn serde_json_write_error_classified_as_broken_pipe() {
+        struct BrokenPipeWriter;
+        impl std::io::Write for BrokenPipeWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let result = serde_json::to_writer_pretty(&mut BrokenPipeWriter, &serde_json::json!(1))
+            .map_err(std::io::Error::from);
+        let err = anyhow::Error::from(result.unwrap_err());
+        assert!(is_broken_pipe(&err));
+    }
 }

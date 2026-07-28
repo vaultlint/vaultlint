@@ -22,7 +22,7 @@ pub fn render(report: &ScanReport, out: &mut dyn Write) -> anyhow::Result<()> {
             "results": report.findings.iter().map(result).collect::<Vec<_>>(),
         }]
     });
-    serde_json::to_writer_pretty(&mut *out, &document)?;
+    serde_json::to_writer_pretty(&mut *out, &document).map_err(std::io::Error::from)?;
     writeln!(out)?;
     Ok(())
 }
