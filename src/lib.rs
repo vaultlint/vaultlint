@@ -103,7 +103,7 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
             }
             Err(error) => skipped.push(SkippedFile {
                 path,
-                reason: error.to_string(),
+                reason: format!("{error:#}"),
             }),
         }
     }
