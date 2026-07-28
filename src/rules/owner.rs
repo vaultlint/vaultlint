@@ -744,12 +744,26 @@ mod tests {
         assert!(findings.is_empty());
     }
 
+    /// The method-call form `account.try_deserialize(…)` is how Anchor's typed
+    /// `Account<'info, T>` works internally, after the framework has already
+    /// checked the account owner. `is_deserialiser` matches only `Expr::Call`
+    /// with a path callee, so the method form is invisible to it and produces no
+    /// finding. The fixture contains raw bytes (`data.borrow()`) which reaches the
+    /// method call, so the positive case (path-call form) produces a finding on
+    /// the same shape.
+    ///
+    /// Killing mutation: in `RawReadFinder::visit_expr_call`, also match
+    /// `visit_expr_method_call` so that `account.try_deserialize(…)` is treated
+    /// as a raw read. The test then produces one finding instead of zero.
     #[test]
     fn ignores_typed_anchor_accounts() {
         let findings = findings_for(
             r#"
             pub fn read_config(ctx: Context<ReadConfig>) -> Result<()> {
-                let fee = ctx.accounts.config.fee;
+                let account = &ctx.accounts.config;
+                let mut data = account.data.borrow();
+                let config = account.try_deserialize(&mut data.as_ref())?;
+                msg!("{}", config.fee);
                 Ok(())
             }
         "#,

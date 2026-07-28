@@ -1,4 +1,4 @@
-//! Binary-level integration tests for the SARIF output format.
+//! Binary-level integration tests for the SARIF and JSON output formats.
 //!
 //! These tests drive the real binary with a relative scan root, which is the
 //! common case.  Unit tests in `src/report/mod.rs` build `ScanReport` with
@@ -131,4 +131,142 @@ fn sarif_and_json_exit_zero_on_broken_pipe() {
             "broken pipe with --format {format} must produce no stderr, got: {stderr:?}"
         );
     }
+}
+
+// ── JSON binary-level tests ───────────────────────────────────────────────────
+
+/// Run `vaultlint scan <path> --format json --fail-on never` and return the
+/// parsed JSON envelope.
+fn scan_json(path: &str) -> serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_vaultlint"))
+        .args(["scan", path, "--format", "json", "--fail-on", "never"])
+        .output()
+        .expect("failed to spawn vaultlint");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.stderr.is_empty(),
+        "expected empty stderr, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("failed to parse JSON output: {e}\n{stdout}"))
+}
+
+/// `--format json` must produce the envelope object `{ "findings": [...],
+/// "skipped": [...] }` with at least one finding when run over the vulnerable
+/// examples. The finding must carry the expected fields.
+///
+/// Kill: revert json.rs to emit a bare array. Then `parsed["findings"]` is null
+/// and the `as_array()` unwrap panics.
+#[test]
+fn json_format_emits_envelope_with_findings_array() {
+    let json = scan_json("examples/vulnerable");
+
+    assert!(json.is_object(), "JSON root must be an object, got: {json}");
+
+    let findings = json["findings"]
+        .as_array()
+        .expect("JSON envelope must have a 'findings' array");
+    assert!(
+        !findings.is_empty(),
+        "expected at least one finding from examples/vulnerable"
+    );
+
+    // Spot-check the first finding's required fields.
+    let first = &findings[0];
+    assert!(
+        first["rule_id"].is_string(),
+        "finding must have a string rule_id; got: {first}"
+    );
+    assert!(
+        first["severity"].is_string(),
+        "finding must have a string severity; got: {first}"
+    );
+    assert!(
+        first["line"].is_number(),
+        "finding must have a numeric line; got: {first}"
+    );
+
+    // The skipped array must also be present (even if empty).
+    assert!(
+        json["skipped"].is_array(),
+        "JSON envelope must have a 'skipped' array; got: {json}"
+    );
+}
+
+/// A directory that contains an unparseable `.rs` file must record that file in
+/// the `"skipped"` array of the JSON envelope, with a non-empty `"reason"`.
+/// Before the envelope was introduced, the skipped file was silently absent from
+/// the output, giving CI a false "no findings" signal for code it could not read.
+///
+/// Kill: remove the `skipped` key from the JSON envelope in json.rs. Then
+/// `json["skipped"].as_array()` returns `None` and the assertion panics.
+///
+/// Kill (reason field): omit the `reason` field from each `SkippedFile`
+/// serialisation. Then `skipped[0]["reason"].as_str()` returns `None`.
+#[test]
+fn json_format_reports_unparseable_file_in_skipped_array() {
+    let dir = std::env::temp_dir().join("vaultlint_r9_json_unparseable");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // A valid file so there is at least one finding (VL004) alongside the skip.
+    std::fs::write(
+        dir.join("valid.rs"),
+        "use solana_program::pubkey::Pubkey;\n\
+         pub fn f(s: &[&[u8]], id: &Pubkey) -> Pubkey {\n\
+             Pubkey::create_program_address(s, id).unwrap()\n\
+         }\n",
+    )
+    .unwrap();
+    // An unparseable file — must appear in skipped[].
+    std::fs::write(dir.join("broken.rs"), "fn oops( { not valid rust").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_vaultlint"))
+        .args([
+            "scan",
+            dir.to_str().unwrap(),
+            "--format",
+            "json",
+            "--fail-on",
+            "never",
+        ])
+        .output()
+        .expect("failed to spawn vaultlint");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("failed to parse JSON output: {e}\n{stdout}"));
+
+    let skipped = json["skipped"]
+        .as_array()
+        .expect("JSON envelope must have a 'skipped' array");
+    assert_eq!(
+        skipped.len(),
+        1,
+        "exactly one file must be skipped; got: {skipped:?}"
+    );
+
+    let reason = skipped[0]["reason"]
+        .as_str()
+        .expect("skipped entry must have a 'reason' string");
+    assert!(
+        !reason.is_empty(),
+        "skipped reason must not be empty; got: {skipped:?}"
+    );
+    // The reason must identify what went wrong (contains parsing error context).
+    assert!(
+        reason.contains("parsing") || reason.len() > 10,
+        "reason must describe the parse failure; got: {reason:?}"
+    );
+
+    // The valid file's finding must still appear — the skip must not suppress
+    // all output from the same directory.
+    let findings = json["findings"]
+        .as_array()
+        .expect("JSON envelope must have a 'findings' array");
+    assert!(
+        !findings.is_empty(),
+        "findings from the valid file must appear even when another file was skipped"
+    );
 }

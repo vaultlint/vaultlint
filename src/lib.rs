@@ -434,4 +434,54 @@ pub fn withdraw(vault: &mut Vault, amount: u64) {
             .collect();
         assert!(vl003.is_empty(), "expected no VL003 findings: {:?}", vl003);
     }
+
+    /// Two distinct rules fire on a single source file: VL004 fires on
+    /// `create_program_address` and VL002 fires on a raw deserialisation without
+    /// an owner check.  Both findings must appear in the same report, attributed
+    /// to the same file.
+    ///
+    /// Kill (VL004 half): remove `create_program_address` from the source. Then
+    /// only one finding is reported and `assert_eq!(findings.len(), 2)` fails.
+    ///
+    /// Kill (VL002 half): remove the `try_from_slice` call. Then only one finding
+    /// is reported and `assert_eq!(findings.len(), 2)` fails.
+    #[test]
+    fn two_rules_fire_on_one_file() {
+        let dir = std::env::temp_dir().join("vaultlint_two_rules_one_file");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // VL004: create_program_address (non-canonical bump).
+        // VL002: try_from_slice on raw account bytes without an owner check.
+        fs::write(
+            dir.join("lib.rs"),
+            "use solana_program::pubkey::Pubkey;\n\
+             pub fn bad(program_id: &Pubkey, account: &solana_program::account_info::AccountInfo, seeds: &[&[u8]]) -> solana_program::program_error::ProgramError {\n\
+             Pubkey::create_program_address(seeds, program_id).unwrap();\n\
+             let _ = MyStruct::try_from_slice(&account.data.borrow())?;\n\
+             Ok(())\n\
+             }\n",
+        )
+        .unwrap();
+
+        let report = scan(&ScanOptions::new(&dir));
+
+        let rule_ids: Vec<&str> = report.findings.iter().map(|f| f.rule_id.as_ref()).collect();
+        assert!(
+            rule_ids.contains(&"VL004"),
+            "VL004 must fire on create_program_address; got: {rule_ids:?}"
+        );
+        assert!(
+            rule_ids.contains(&"VL002"),
+            "VL002 must fire on unchecked deserialisation; got: {rule_ids:?}"
+        );
+        assert_eq!(
+            report.findings.len(),
+            2,
+            "exactly two findings (one per rule); got: {:?}",
+            report.findings
+        );
+        // Both findings must attribute to the same file.
+        let files: std::collections::HashSet<_> = report.findings.iter().map(|f| &f.file).collect();
+        assert_eq!(files.len(), 1, "both findings must be on the same file");
+    }
 }

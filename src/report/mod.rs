@@ -122,6 +122,30 @@ mod tests {
         assert_eq!(exit_code(&report(Vec::new()), FailOn::Low), 0);
     }
 
+    /// A Low-severity finding must exit 1 when `--fail-on low` is set, and exit 0
+    /// when `--fail-on medium` or `--fail-on high` is set.
+    ///
+    /// Kill (Low boundary): change `FailOn::Low => Some(Severity::Low)` in
+    /// `FailOn::threshold` to `FailOn::Low => Some(Severity::Medium)`. Then
+    /// `exit_code(&low_report, FailOn::Low)` returns 0 instead of 1 and the
+    /// first assertion fails.
+    ///
+    /// Kill (floor boundary): change `FailOn::High => Some(Severity::High)` to
+    /// `FailOn::High => None`. Then `exit_code(&low_report, FailOn::High)` returns 1
+    /// instead of 0 and the second assertion fails.
+    #[test]
+    fn fail_on_low_triggers_on_a_low_severity_finding() {
+        let low_report = report(vec![finding(Severity::Low)]);
+
+        // A Low finding must trigger when the threshold is Low.
+        assert_eq!(exit_code(&low_report, FailOn::Low), 1);
+        // A Low finding must NOT trigger when the threshold is Medium or High.
+        assert_eq!(exit_code(&low_report, FailOn::Medium), 0);
+        assert_eq!(exit_code(&low_report, FailOn::High), 0);
+        // Never must always return 0 regardless of severity.
+        assert_eq!(exit_code(&low_report, FailOn::Never), 0);
+    }
+
     // ── JSON ──────────────────────────────────────────────────────────────────
 
     /// Kill: revert json.rs to emit a bare array.

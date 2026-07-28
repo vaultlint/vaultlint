@@ -216,6 +216,16 @@ mod tests {
         assert_eq!(findings[0].line, 3);
     }
 
+    /// `find_program_address` is not in the rule's match list: it always returns
+    /// the canonical (highest) bump, so using it carries no bump-canonicality
+    /// risk. The rule only fires on `create_program_address` (whose match is
+    /// verified by `flags_raw_create_program_address`). The two calls differ by
+    /// exactly the guard being tested.
+    ///
+    /// Killing mutation: add `"find_program_address"` to the string compared
+    /// against `"create_program_address"` in `DerivationVisitor::visit_expr_call`
+    /// (or change the comparison to a contains-check on any `_program_address`
+    /// suffix). The test then produces one finding instead of zero.
     #[test]
     fn accepts_find_program_address() {
         let findings = findings_for(
@@ -228,5 +238,6 @@ mod tests {
         );
 
         assert!(findings.is_empty());
+        // Companion: create_program_address IS flagged (see flags_raw_create_program_address).
     }
 }

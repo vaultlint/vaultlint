@@ -170,6 +170,10 @@ mod tests {
         assert_eq!(findings[0].line, 3);
     }
 
+    /// Kill (rule_id): change the emitted rule id to a different string.
+    /// Kill (severity): change `Severity::Low` to `Severity::Medium` in
+    /// `compound_arithmetic`'s report call.
+    /// Kill (rule): change `AddAssign` to not match in `compound_arithmetic`.
     #[test]
     fn flags_compound_assignment_into_account_state() {
         let findings = findings_for(
@@ -182,6 +186,8 @@ mod tests {
         );
 
         assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "VL003");
+        assert_eq!(findings[0].severity, Severity::Low);
     }
 
     #[test]

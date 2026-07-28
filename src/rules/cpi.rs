@@ -709,12 +709,29 @@ mod tests {
         assert!(f.is_empty());
     }
 
+    /// T1 and T2 are both satisfied — an `Instruction` struct literal is built
+    /// with a `.key`-derived program id — but the dispatch call is a helper
+    /// function named `send_cpi`, not `invoke` or `invoke_signed`. `CpiFinder`
+    /// only records calls whose last path segment is in `CPI_CALLS`, so `send_cpi`
+    /// is not collected and no finding is produced. The fixture differs from its
+    /// positive counterpart (`flags_instruction_struct_literal_with_account_derived_program_id`)
+    /// by exactly the call name: `invoke` fires, `send_cpi` does not.
+    ///
+    /// Killing mutation: in `CpiFinder::visit_expr_call`, remove the
+    /// `CPI_CALLS.contains(…)` guard so that every path call is collected. Then
+    /// `send_cpi(&ix, &[…])` is treated as an invoke, T1 and T2 are satisfied,
+    /// and the test produces one finding instead of zero.
     #[test]
     fn ignores_functions_without_any_cpi() {
         let f = findings(
             r#"
-            pub fn claim(ctx: Context<Claim>) -> Result<()> {
-                ctx.accounts.vault.balance = 0;
+            pub fn claim(ctx: Context<Claim>, data: Vec<u8>) -> Result<()> {
+                let ix = Instruction {
+                    program_id: *ctx.accounts.target_program.key,
+                    accounts: vec![],
+                    data,
+                };
+                send_cpi(&ix, &[ctx.accounts.target_program.clone()])?;
                 Ok(())
             }
         "#,
