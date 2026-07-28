@@ -89,12 +89,12 @@ impl WorkspaceResolver {
         if let Some(cached) = self.dir_cache.borrow().get(&abs_dir) {
             return cached.clone();
         }
-        let result = self.resolve_uncached(&abs_dir, file);
+        let result = self.resolve_uncached(&abs_dir);
         self.dir_cache.borrow_mut().insert(abs_dir, result.clone());
         result
     }
 
-    fn resolve_uncached(&self, abs_dir: &Path, original_file: &Path) -> Workspace {
+    fn resolve_uncached(&self, abs_dir: &Path) -> Workspace {
         let Some(package_manifest) = walk_to_cargo_toml(abs_dir) else {
             return Workspace {
                 manifest: None,
@@ -103,7 +103,7 @@ impl WorkspaceResolver {
         };
         let root_manifest = self.find_workspace_root(&package_manifest);
         let overflow_checks = self.read_overflow_checks(&root_manifest);
-        let reported_manifest = self.reporting_path(&root_manifest, original_file);
+        let reported_manifest = self.reporting_path(&root_manifest);
         Workspace {
             manifest: Some(reported_manifest),
             overflow_checks,
@@ -113,21 +113,15 @@ impl WorkspaceResolver {
     /// Converts an absolute resolved manifest to the path that will appear in
     /// findings. When the scan root was relative and the manifest lies under the
     /// process CWD, strip the CWD prefix so the reported path is relative too.
-    fn reporting_path(&self, abs_manifest: &Path, original_file: &Path) -> PathBuf {
+    fn reporting_path(&self, abs_manifest: &Path) -> PathBuf {
         if !self.report_relative {
             return abs_manifest.to_path_buf();
         }
-        // Keep the same relative/absolute character as the original file the
-        // caller handed.  Strip the CWD when the manifest lies inside it;
-        // otherwise fall back to the absolute path so the user can still find it.
         if let Ok(cwd) = std::env::current_dir() {
             if let Ok(rel) = abs_manifest.strip_prefix(&cwd) {
                 return rel.to_path_buf();
             }
         }
-        // Manifest is outside the CWD; use original_file's root as a hint only
-        // if it gives a better relative rendering, otherwise keep absolute.
-        let _ = original_file;
         abs_manifest.to_path_buf()
     }
 
@@ -153,9 +147,6 @@ impl WorkspaceResolver {
             }
         }
 
-        // Walk up from the package directory's parent looking for a manifest
-        // with a `[workspace]` table.
-        //
         // Deliberate approximation: `workspace.members` globs are not matched.
         // A manifest that declares `[workspace]` without listing a package below
         // it makes Cargo refuse to build, so on any project that compiles,
@@ -253,7 +244,7 @@ fn is_excluded(value: &toml::Value, workspace_dir: &Path, package_dir: &Path) ->
         let Some(rel) = entry.as_str() else {
             continue;
         };
-        let excluded_path = workspace_dir.join(rel);
+        let excluded_path = normalised(&workspace_dir.join(rel));
         if package_dir.starts_with(&excluded_path) {
             return true;
         }
@@ -355,6 +346,37 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("ext/src")).unwrap();
         fs::write(dir.join("Cargo.toml"), "[workspace]\nexclude = [\"ext\"]\n").unwrap();
+        fs::write(
+            dir.join("ext/Cargo.toml"),
+            "[package]\nname = \"ext\"\n\n[profile.release]\noverflow-checks = true\n",
+        )
+        .unwrap();
+        fs::write(dir.join("ext/src/lib.rs"), "").unwrap();
+
+        let resolver = WorkspaceResolver::new(&dir);
+        let ws = resolver.resolve(&dir.join("ext/src/lib.rs"));
+
+        assert!(ws.overflow_checks, "ext has overflow-checks, must be true");
+        assert_eq!(ws.manifest, Some(dir.join("ext/Cargo.toml")));
+    }
+
+    /// A `workspace.exclude` entry spelled with `..` components must still match
+    /// the excluded package.
+    ///
+    /// Kill: remove the `normalised` wrapper from the `excluded_path` join in
+    /// `is_excluded`.
+    #[test]
+    fn an_excluded_package_is_recognised_through_dotdot_spelling() {
+        let dir = std::env::temp_dir().join("vaultlint_ws_excluded_dotdot");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::create_dir_all(dir.join("ext/src")).unwrap();
+        // exclude spells the entry as "sub/../ext" — a detour that resolves to "ext".
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nexclude = [\"sub/../ext\"]\n",
+        )
+        .unwrap();
         fs::write(
             dir.join("ext/Cargo.toml"),
             "[package]\nname = \"ext\"\n\n[profile.release]\noverflow-checks = true\n",

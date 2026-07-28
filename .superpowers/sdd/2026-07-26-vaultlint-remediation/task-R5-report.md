@@ -60,9 +60,11 @@ The controller script resolved workspace roots without honouring `workspace.excl
 attributed `helium-program-library/utils/vehnt` (which helium's root workspace.exclude lists) to
 the helium root, which enables `overflow-checks`. This implementation correctly promotes
 `utils/vehnt` to its own root — a root that does not enable `overflow-checks` — adding 1
-project-level finding + 4 per-op findings. That accounts for 5 of the 26-vs-21 gap. The
-remaining differences:
+project-level finding + 4 per-op findings. The full 26 are composed of:
 
+- **helium-program-library/utils/vehnt** contributes 5 (1 project + 4 per-op): the excluded
+  package is promoted to its own root, which lacks `overflow-checks`. This is why the brief's
+  count of 21 is wrong — its script attributed vehnt to the helium root.
 - **anchor-check** contributes 8 (1 project + 7 per-op): the workspace root has
   `[profile.release]` with `lto = true` but no `overflow-checks`.
 - **protocol-v2** contributes 13 (1 project + 12 per-op): no `overflow-checks`; 12 per-op
@@ -73,8 +75,8 @@ The brief's expected count of 21 is wrong because its measurement script did not
 
 ### VL001/VL002/VL004/VL005 baseline comparison
 
-Measured against `125b590` using `git worktree add /tmp/vl-base 125b590 && cargo build --release`
-from that worktree, then scanning the same twelve trees:
+The reviewer measured `125b590` using `git worktree add /tmp/vl-base 125b590 && cargo build --release`
+from that worktree, then scanned the same twelve trees:
 
 ```
 BASE 125b590 : VL001=4  VL002=24  VL003=382  VL004=61  VL005=21
@@ -136,7 +138,7 @@ recorded in the corpus table above. The four unmodified rules are unchanged.
 Deleted from `src/project.rs`:
 - `// Walk up from \`dir\` to find the nearest ancestor with a Cargo.toml.`
 - `// Step 3: check \`package.workspace\` key for an explicit pointer.`
-- `// Step 4: walk up from the package directory's parent looking for a manifest with a \`[workspace]\` table.`
+- `// Step 4: walk up from the package directory's parent looking for a manifest with a \`[workspace]\` table.` — only the `Step 4:` prefix was stripped in round 1; the restate-the-code sentence survived and was deleted in fix round 2.
 - `// Check if \`workspace.exclude\` lists the package dir.`
 - `// This package is excluded; it is its own root.`
 - `// The package is excluded if its directory starts with an excluded path.`
@@ -172,6 +174,52 @@ filename.
 Note: in fix round 1 this line is now inside `find_workspace_root`, which only receives paths
 that are already absolute (they went through `normalised`), so `parent()` always succeeds. The
 `Path::new("")` fallback remains as a defensive guard.
+
+## Fix Round 2 (task-R5-findings-r2.md)
+
+### Item 1 — Minor 3 completion (`src/project.rs`)
+
+The `// Walk up from the package directory's parent looking for a manifest / with a \`[workspace]\`
+table.` comment was only half-removed in round 1 (the `Step 4:` prefix was stripped but the
+restate-the-code sentence survived). Both lines are now deleted. The "Deliberate approximation"
+paragraph that follows is retained — it carries a non-obvious WHY.
+
+### Item 2 — Dead parameter and false comment (`src/project.rs`)
+
+`reporting_path`'s `original_file` parameter was never used and was silenced with `let _ =
+original_file;` under a comment claiming it would serve as a hint for a better relative rendering.
+No such hint existed. Deleted: the parameter from `reporting_path` and from `resolve_uncached`,
+the `let _` suppression, the two comment lines describing the non-existent behaviour, and the
+stale sentence in the doc comment beginning "Keep the same relative/absolute character as the
+original file the caller handed."
+
+### Item 3 — `is_excluded` normalisation (`src/project.rs`)
+
+`workspace_dir.join(rel)` in `is_excluded` was not going through `normalised`, so a
+`workspace.exclude` entry spelled with `..` components (e.g. `"sub/../ext"`) silently failed to
+match an excluded package. Wrapped with `normalised(...)`.
+
+Kill test added: `an_excluded_package_is_recognised_through_dotdot_spelling` — same tree as
+`an_excluded_package_is_its_own_root` but the root manifest spells the exclude entry
+`"sub/../ext"`. Kill: remove the `normalised` wrapper → test FAILED (assertion `ext has
+overflow-checks, must be true`). Restored; recorded.
+
+### Item 4 — Report inaccuracies corrected
+
+- `:139` (original line numbering): the round-1 Minor 1–7 entry now accurately notes that only
+  the `Step 4:` prefix was stripped in round 1 and the sentence was deleted in round 2.
+- `:64-69`: "The remaining differences:" was replaced with "The full 26 are composed of:" and the
+  helium/vehnt row made explicit. The old phrasing falsely implied unexplained residual after
+  accounting for the vehnt gap; in fact the three trees (vehnt 5 + anchor-check 8 + protocol-v2
+  13 = 26) are the complete composition.
+- `:76-77` / `:131-132`: the first-person "Measured against…" in the baseline section now reads
+  "The reviewer measured…", matching the attribution in the I2 fix-round-1 entry.
+
+### Controller ruling — no code change
+
+The round-1 finding that "a report must not mix relative and absolute paths for one run" contradicts
+the behaviour prescribed by the rule it was attached to. The rule governs; the sentence was wrong.
+Recorded; no code change.
 
 ## Concerns
 
