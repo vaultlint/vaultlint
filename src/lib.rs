@@ -20,6 +20,7 @@ pub struct ScanOptions {
     pub root: PathBuf,
 }
 
+#[derive(serde::Serialize)]
 pub struct SkippedFile {
     pub path: PathBuf,
     pub reason: String,
@@ -31,6 +32,9 @@ pub struct ScanReport {
     pub anchor_version: Option<String>,
     pub findings: Vec<Finding>,
     pub skipped: Vec<SkippedFile>,
+    /// Absolute path of the directory that was scanned. Set by `scan()`; only
+    /// `None` in unit tests that construct `ScanReport` directly.
+    pub scan_root: Option<std::path::PathBuf>,
 }
 
 pub fn scan(options: &ScanOptions) -> ScanReport {
@@ -155,6 +159,7 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
         anchor_version: project.anchor_version,
         findings,
         skipped,
+        scan_root: Some(project::normalised(&options.root)),
     }
 }
 

@@ -206,7 +206,7 @@ impl Default for WorkspaceResolver {
 /// Two spellings of one manifest have to be one key, and a relative scan root has to be
 /// able to see a workspace root above the process working directory. `canonicalize` would
 /// do both but also resolves symlinks and fails on paths that do not exist.
-fn normalised(path: &Path) -> PathBuf {
+pub fn normalised(path: &Path) -> PathBuf {
     let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let mut out = PathBuf::new();
     for component in abs.components() {

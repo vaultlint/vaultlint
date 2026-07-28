@@ -16,9 +16,14 @@ pub fn render(report: &ScanReport, out: &mut dyn Write, colour: bool) -> std::io
     } else {
         String::new()
     };
+    let file_noun = if report.files_scanned == 1 {
+        "file"
+    } else {
+        "files"
+    };
     writeln!(
         out,
-        "→ analyzing {} Rust files{anchor}{test_skip} …",
+        "→ analyzing {} Rust {file_noun}{anchor}{test_skip} …",
         report.files_scanned
     )?;
 
