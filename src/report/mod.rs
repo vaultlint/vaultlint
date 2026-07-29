@@ -89,6 +89,7 @@ mod tests {
             anchor_version: Some("0.30.1".to_string()),
             findings,
             skipped: Vec::<SkippedFile>::new(),
+            program_ids: Vec::new(),
             scan_root: None,
         }
     }
@@ -276,6 +277,7 @@ mod tests {
                 docs_url: "https://vaultlint.com/rules/VL002/".to_string(),
             }],
             skipped: vec![],
+            program_ids: Vec::new(),
             scan_root: None,
         };
         r.scan_root = Some(scan_root.clone());
@@ -316,6 +318,7 @@ mod tests {
                 docs_url: "https://vaultlint.com/rules/VL003/".to_string(),
             }],
             skipped: vec![],
+            program_ids: Vec::new(),
             scan_root: None,
         };
         r.scan_root = Some(scan_root.clone());

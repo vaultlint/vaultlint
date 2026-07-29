@@ -136,6 +136,7 @@ mod tests {
                 docs_url: "https://vaultlint.com/rules/VL002/".to_string(),
             }],
             skipped: Vec::new(),
+            program_ids: Vec::new(),
             scan_root: None,
         }
     }

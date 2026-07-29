@@ -1,6 +1,7 @@
 pub(crate) mod anchor;
 pub mod finding;
 pub(crate) mod parse;
+pub mod programid;
 pub(crate) mod project;
 pub mod report;
 pub(crate) mod rules;
@@ -47,6 +48,9 @@ pub struct ScanReport {
     pub anchor_version: Option<String>,
     pub findings: Vec<Finding>,
     pub skipped: Vec<SkippedFile>,
+    /// Every `declare_id!` the tree spells out, in scan order and de-duplicated
+    /// by address. The join key between this repository and a cluster.
+    pub program_ids: Vec<programid::DeclaredId>,
     /// Absolute path of the directory that was scanned. Set by `scan()`; only
     /// `None` in unit tests that construct `ScanReport` directly.
     pub scan_root: Option<std::path::PathBuf>,
@@ -65,6 +69,8 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
     let mut linked_files = Vec::new();
     let mut roots_without_overflow_checks: BTreeSet<PathBuf> = BTreeSet::new();
     let mut onchain_roots: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut program_ids: Vec<programid::DeclaredId> = Vec::new();
+    let mut seen_addresses: BTreeSet<String> = BTreeSet::new();
 
     // Collect all candidate files first so M3 can be resolved across the tree.
     let all_files = scan::rust_files(&options.root);
@@ -102,6 +108,12 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
                     !suppress::is_suppressed(&file.source, finding)
                         && !scope::in_test_range(finding.line, &test_ranges)
                 });
+
+                for declared in programid::collect(&file.path, &file.ast) {
+                    if seen_addresses.insert(declared.address.clone()) {
+                        program_ids.push(declared);
+                    }
+                }
 
                 if let Some(manifest) = &workspace.manifest {
                     if is_onchain_source(&file.source) {
@@ -178,6 +190,7 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
         anchor_version: project.anchor_version,
         findings,
         skipped,
+        program_ids,
         scan_root: Some(project::normalised(&options.root)),
     }
 }
