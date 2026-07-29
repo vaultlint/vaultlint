@@ -350,7 +350,7 @@ impl UseSiteIndex {
         let mut cache = self.parsed.borrow_mut();
         if !cache.contains_key(path) {
             let source = std::fs::read_to_string(path).ok()?;
-            let parsed = syn::parse_file(&source).ok()?;
+            let parsed = crate::parse::parse_source(&source).ok()?;
             cache.insert(path.to_path_buf(), parsed);
         }
         let ast = cache.get(path)?;

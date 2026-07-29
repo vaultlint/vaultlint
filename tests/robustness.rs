@@ -73,49 +73,78 @@ fn write_deep_file(dir: &Path, depth: usize) {
 /// either skips the file or scans it, and exits with code 0 or 1, never with
 /// a signal (exit code 134 / SIGABRT).
 ///
+/// Two things stand between this fixture and a SIGABRT, and the two depths test
+/// them separately.
+///
 /// Measured on this machine (macOS, Apple Silicon):
 ///   - Default-stack overflow threshold, dev   profile: 380 nested blocks
 ///   - Default-stack overflow threshold, release profile: 1619 nested blocks
 ///   - 64 MiB-stack overflow threshold, dev   profile: 3065 nested blocks
 ///   - 64 MiB-stack overflow threshold, release profile: 13027 nested blocks
 ///
-/// DEPTH = 2200 sits above both default-stack thresholds with >25% headroom
-/// and below both 64 MiB thresholds with >25% headroom in both profiles.
+/// `WITHIN_LIMIT` sits above both default-stack thresholds and below
+/// `parse::MAX_DELIMITER_DEPTH`, so the file is genuinely parsed, on the big
+/// stack. `PAST_LIMIT` is above every threshold above, including release's, so
+/// nothing but the depth guard keeps the process alive.
 ///
-/// Kill: remove the `thread::Builder::new().stack_size(64 << 20).spawn(…)` call
-/// from `src/main.rs` and restore the direct `scan(…)` call on the main thread.
-/// The binary then exits with code 134 (SIGABRT) instead of 0/1, and the
-/// assertion `code != 134` fails — in both dev and release.
+/// Kill (big stack): remove the `thread::Builder::new().stack_size(64 << 20)`
+/// call from `src/main.rs`. The `WITHIN_LIMIT` case then exits 134.
+/// Kill (depth guard): remove the `MAX_DELIMITER_DEPTH` check from
+/// `src/parse.rs`. The `PAST_LIMIT` case then exits 134.
 #[test]
 fn deep_nesting_does_not_crash_the_binary() {
-    // DEPTH sits above both default-stack overflow thresholds (380 dev, 1619
-    // release) and below both 64 MiB thresholds (3065 dev, 13027 release),
-    // each with at least 25% headroom on both sides in both profiles.
-    const DEPTH: usize = 2200;
+    const WITHIN_LIMIT: usize = 1000;
+    const PAST_LIMIT: usize = 16_000;
 
-    let dir = std::env::temp_dir().join("vaultlint_r6_deep_nesting");
+    for depth in [WITHIN_LIMIT, PAST_LIMIT] {
+        let dir = std::env::temp_dir().join(format!("vaultlint_r6_deep_nesting_{depth}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        write_deep_file(&dir, depth);
+
+        let output = Command::new(env!("CARGO_BIN_EXE_vaultlint"))
+            .args(["scan", dir.to_str().unwrap(), "--fail-on", "never"])
+            .output()
+            .expect("failed to spawn vaultlint");
+
+        let code = output.status.code();
+
+        assert!(
+            code.is_some(),
+            "at depth {depth}: binary must not be killed by a signal (SIGABRT/stack overflow)"
+        );
+        assert_ne!(
+            code,
+            Some(134),
+            "at depth {depth}: exit code 134 means SIGABRT — the scan thread still overflowed"
+        );
+        // With --fail-on never and no security findings in the fixture, exit 0.
+        assert_eq!(code, Some(0), "at depth {depth}: expected 0, got {code:?}");
+    }
+}
+
+/// A file turned away by the depth guard must say so, not vanish. A silently
+/// dropped file is a false negative that looks like a clean scan.
+///
+/// Kill: in `src/lib.rs`, drop the parse error instead of pushing a
+/// `SkippedFile`.
+#[test]
+fn a_file_past_the_depth_limit_is_reported_as_skipped() {
+    let dir = std::env::temp_dir().join("vaultlint_r6_deep_nesting_reported");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
-    write_deep_file(&dir, DEPTH);
+    write_deep_file(&dir, 16_000);
 
     let output = Command::new(env!("CARGO_BIN_EXE_vaultlint"))
         .args(["scan", dir.to_str().unwrap(), "--fail-on", "never"])
         .output()
         .expect("failed to spawn vaultlint");
 
-    let code = output.status.code();
-
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        code.is_some(),
-        "binary must not be killed by a signal (SIGABRT/stack overflow)"
+        stdout.contains("skipped") && stdout.contains("deep.rs"),
+        "the skipped file must be named in the report, got:\n{stdout}"
     );
-    assert_ne!(
-        code,
-        Some(134),
-        "exit code 134 means SIGABRT — the scan thread still overflowed"
-    );
-    // With --fail-on never and no security findings in the fixture, exit 0.
-    assert_eq!(code, Some(0), "expected exit code 0, got: {code:?}");
 }
 
 // ── 3. Broken pipe ────────────────────────────────────────────────────────────

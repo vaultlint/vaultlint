@@ -38,7 +38,7 @@ pub fn collect_m3_set(files: &[PathBuf]) -> HashSet<PathBuf> {
         let Ok(source) = std::fs::read_to_string(file) else {
             continue;
         };
-        let Ok(ast) = syn::parse_file(&source) else {
+        let Ok(ast) = crate::parse::parse_source(&source) else {
             continue;
         };
         // Rust's module resolution: given `foo/bar.rs`, `mod sub;` resolves to

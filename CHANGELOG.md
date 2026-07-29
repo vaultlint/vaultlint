@@ -44,6 +44,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   measurement corpus this is the difference between exit 1 and exit 0; the finding
   count is unchanged.
 
+### Fixed
+
+- **A file nested thousands of blocks deep no longer aborts the scan.** `syn` parses
+  by recursive descent, so past a few thousand `{` it exhausts the stack — an abort
+  the process cannot catch, which took the whole run down and reported nothing, not
+  even the files already scanned. Every parse now runs a depth check first and skips
+  the file with a reason, the same way an unparsable one is skipped. The check reads
+  bytes iteratively and ignores delimiters inside comments, strings and character
+  literals, so it cannot overflow on the input it is guarding against. The limit is
+  1024, eight times deeper than rustc's own recursion limit and far past anything
+  real code reaches: nothing in the `coral-xyz/anchor` corpus is skipped.
+
 ## [0.1.0] — 2026-07-28
 
 First public release.
