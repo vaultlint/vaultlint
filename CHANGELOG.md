@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JSON and SARIF output and nowhere in the one people read. The URL also carries
   the rule id, which a `// vaultlint:allow VL002` comment needs and the human report
   otherwise never spelled out.
+- **`SkippedFile` derives `Deserialize`, `Clone` and `PartialEq`.** `Finding` and
+  `Severity` already did, so a consumer reading a scan back from JSON had to declare
+  its own struct for the other half of the envelope.
 - **`VL002` and `VL005` now resolve `#[access_control(...)]`.** Anchor expands the
   attribute so the named function runs — and its error aborts the instruction —
   before the handler body, and programs put owner and program-id checks there. Both

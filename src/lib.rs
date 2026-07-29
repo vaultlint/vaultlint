@@ -31,7 +31,7 @@ impl ScanOptions {
 }
 
 /// A file that could not be parsed and was skipped.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct SkippedFile {
     pub path: PathBuf,

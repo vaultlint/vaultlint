@@ -185,3 +185,37 @@ fn json_round_trip_of_scan_report() {
         );
     }
 }
+
+/// The `skipped` array is the other half of the JSON envelope, and a consumer
+/// that reads it back should not have to declare its own struct for a type
+/// vaultlint already exports.
+///
+/// Kill (Deserialize derive): remove `#[derive(Deserialize)]` from
+/// `SkippedFile`. Then `serde_json::from_value::<Vec<SkippedFile>>(…)` does not
+/// compile.
+#[test]
+fn json_round_trip_of_skipped_files() {
+    use vaultlint::report::json;
+    use vaultlint::SkippedFile;
+
+    let dir = std::env::temp_dir().join("vaultlint_round_trip_skipped");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    std::fs::write(dir.join("broken.rs"), "pub fn f( {").unwrap();
+
+    let report = scan(&ScanOptions::new(&dir));
+    assert_eq!(
+        report.skipped.len(),
+        1,
+        "fixture must produce exactly one skipped file"
+    );
+
+    let mut buf = Vec::new();
+    json::render(&report, &mut buf).unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+
+    let restored: Vec<SkippedFile> = serde_json::from_value(parsed["skipped"].clone())
+        .expect("skipped must deserialise into Vec<SkippedFile>");
+    assert_eq!(restored, report.skipped);
+}

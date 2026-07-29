@@ -326,6 +326,17 @@ mod tests {
         assert!(!is_cfg_test_attr(&attr));
     }
 
+    /// A cfg flag whose name merely contains `test` — must reject. This is the
+    /// bare-path branch, so the feature-flag test above does not cover it.
+    ///
+    /// Killing mutation: in `meta_contains_bare_test`, replace
+    /// `path.is_ident("test")` with a contains-check on the path's text.
+    #[test]
+    fn cfg_test_recogniser_rejects_a_flag_merely_containing_test() {
+        let attr = parse_attr("#[cfg(contest)]");
+        assert!(!is_cfg_test_attr(&attr));
+    }
+
     // ── M1: integration-test / bench files ──────────────────────────────────
 
     /// A file whose path relative to its crate root starts with `tests` is
