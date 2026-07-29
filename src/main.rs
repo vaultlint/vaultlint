@@ -28,6 +28,12 @@ enum Command {
         fail_on: FailOnArg,
         #[arg(long, value_enum, default_value_t = FormatArg::Human)]
         format: FormatArg,
+        /// Ask Solana mainnet what is deployed at each declared program id
+        #[arg(long)]
+        mainnet: bool,
+        /// Ask this JSON-RPC endpoint instead of the public mainnet one
+        #[arg(long, value_name = "URL")]
+        rpc_url: Option<String>,
     },
 }
 
@@ -73,11 +79,22 @@ fn main() -> ExitCode {
         path,
         fail_on,
         format,
+        mainnet,
+        rpc_url,
     } = cli.command;
 
     if !path.exists() {
         eprintln!("error: path does not exist: {}", path.display());
         return ExitCode::from(2);
+    }
+
+    // An explicit endpoint implies the lookup; `--mainnet` is the shorthand for
+    // the public one.
+    let endpoint =
+        rpc_url.or_else(|| mainnet.then(|| vaultlint::onchain::MAINNET_BETA.to_string()));
+    let mut options = ScanOptions::new(path);
+    if let Some(endpoint) = endpoint {
+        options = options.with_rpc_url(endpoint);
     }
 
     // Run the scan on a thread with a large stack so that deeply nested
@@ -88,7 +105,7 @@ fn main() -> ExitCode {
     let scan_thread = std::thread::Builder::new()
         .name("vaultlint-scan".into())
         .stack_size(64 << 20) // 64 MiB
-        .spawn(move || scan(&ScanOptions::new(path)));
+        .spawn(move || scan(&options));
 
     let report_data = match scan_thread {
         Err(e) => {

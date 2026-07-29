@@ -3,6 +3,7 @@ use std::io::Write;
 use owo_colors::OwoColorize;
 
 use crate::finding::{Finding, Severity};
+use crate::onchain::State;
 use crate::ScanReport;
 
 pub fn render(report: &ScanReport, out: &mut dyn Write, colour: bool) -> std::io::Result<()> {
@@ -35,6 +36,8 @@ pub fn render(report: &ScanReport, out: &mut dyn Write, colour: bool) -> std::io
             skipped.reason
         )?;
     }
+
+    render_deployments(report, out, colour)?;
 
     if report.findings.is_empty() {
         writeln!(out, "\n✓ no issues found")?;
@@ -69,6 +72,58 @@ pub fn render(report: &ScanReport, out: &mut dyn Write, colour: bool) -> std::io
         write!(out, " · {low} low")?;
     }
     writeln!(out)
+}
+
+/// What the cluster says about each declared program id.
+///
+/// Printed above the findings and never as one: this is the state of the
+/// deployment, not a defect in the source, and the reader needs it before the
+/// findings to know whether any of them are running.
+fn render_deployments(
+    report: &ScanReport,
+    out: &mut dyn Write,
+    colour: bool,
+) -> std::io::Result<()> {
+    if report.deployments.is_empty() {
+        return Ok(());
+    }
+    let noun = if report.deployments.len() == 1 {
+        "program id"
+    } else {
+        "program ids"
+    };
+    writeln!(
+        out,
+        "\n→ on chain · {} declared {noun}",
+        report.deployments.len()
+    )?;
+    for deployment in &report.deployments {
+        let address = if colour {
+            deployment.declared.address.bold().to_string()
+        } else {
+            deployment.declared.address.clone()
+        };
+        writeln!(out, "  {address}  {}", describe(&deployment.state))?;
+    }
+    Ok(())
+}
+
+fn describe(state: &State) -> String {
+    match state {
+        State::Absent => "no account at this address".to_string(),
+        State::NotAProgram { owner } => format!("not a program — owned by {owner}"),
+        State::Immutable => {
+            "deployed, non-upgradeable loader — the code cannot be replaced".to_string()
+        }
+        State::Frozen { last_deploy_slot } => {
+            format!("deployed, upgrade authority revoked — last deploy at slot {last_deploy_slot}")
+        }
+        State::Upgradeable {
+            authority,
+            last_deploy_slot,
+        } => format!("upgradeable by {authority} — last deploy at slot {last_deploy_slot}"),
+        State::Unavailable { reason } => format!("could not be checked: {reason}"),
+    }
 }
 
 /// The rule's documentation page. It is also the only place the human report
@@ -137,6 +192,7 @@ mod tests {
             }],
             skipped: Vec::new(),
             program_ids: Vec::new(),
+            deployments: Vec::new(),
             scan_root: None,
         }
     }
@@ -154,6 +210,48 @@ mod tests {
     #[test]
     fn a_finding_carries_its_documentation_url() {
         assert!(render_to_string(false).contains("https://vaultlint.com/rules/VL002/"));
+    }
+
+    /// An offline scan must not gain a section about a cluster it never asked.
+    ///
+    /// Kill: print the heading unconditionally in `render_deployments`.
+    #[test]
+    fn an_offline_report_says_nothing_about_a_cluster() {
+        assert!(!render_to_string(false).contains("on chain"));
+    }
+
+    /// Each state has to read as a different claim. `Absent` in particular must
+    /// not be phrased as immutability — eight ids in the measured corpus are
+    /// absent and none of the forty-four live ones are frozen.
+    ///
+    /// Kill: collapse any two arms of `describe` into one string.
+    #[test]
+    fn every_deployment_state_reads_differently() {
+        let lines: Vec<String> = [
+            State::Absent,
+            State::NotAProgram {
+                owner: "Tokenkeg".to_string(),
+            },
+            State::Immutable,
+            State::Frozen {
+                last_deploy_slot: 1,
+            },
+            State::Upgradeable {
+                authority: "AUTH".to_string(),
+                last_deploy_slot: 2,
+            },
+            State::Unavailable {
+                reason: "timeout".to_string(),
+            },
+        ]
+        .iter()
+        .map(describe)
+        .collect();
+
+        let unique: std::collections::BTreeSet<&String> = lines.iter().collect();
+        assert_eq!(unique.len(), lines.len(), "{lines:?}");
+        assert!(lines[4].contains("AUTH") && lines[4].contains('2'));
+        assert!(lines[5].contains("timeout"));
     }
 
     /// Piped output must stay free of escape sequences — CI logs and `grep` see

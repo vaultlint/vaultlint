@@ -1,5 +1,6 @@
 pub(crate) mod anchor;
 pub mod finding;
+pub mod onchain;
 pub(crate) mod parse;
 pub mod programid;
 pub(crate) mod project;
@@ -22,12 +23,24 @@ use usesite::UseSiteIndex;
 #[non_exhaustive]
 pub struct ScanOptions {
     pub root: PathBuf,
+    /// JSON-RPC endpoint to ask about the program ids the tree declares.
+    /// `None` — the default — keeps the scan entirely offline.
+    pub rpc_url: Option<String>,
 }
 
 impl ScanOptions {
-    /// Create a new `ScanOptions` with the given scan root.
+    /// Create a new `ScanOptions` with the given scan root. Offline.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        ScanOptions { root: root.into() }
+        ScanOptions {
+            root: root.into(),
+            rpc_url: None,
+        }
+    }
+
+    /// Ask `rpc_url` what is deployed at each declared program id.
+    pub fn with_rpc_url(mut self, rpc_url: impl Into<String>) -> Self {
+        self.rpc_url = Some(rpc_url.into());
+        self
     }
 }
 
@@ -51,6 +64,9 @@ pub struct ScanReport {
     /// Every `declare_id!` the tree spells out, in scan order and de-duplicated
     /// by address. The join key between this repository and a cluster.
     pub program_ids: Vec<programid::DeclaredId>,
+    /// What the cluster said about each declared id. Empty unless
+    /// [`ScanOptions::rpc_url`] was set.
+    pub deployments: Vec<onchain::Deployment>,
     /// Absolute path of the directory that was scanned. Set by `scan()`; only
     /// `None` in unit tests that construct `ScanReport` directly.
     pub scan_root: Option<std::path::PathBuf>,
@@ -184,6 +200,11 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
             .then_with(|| a.rule_id.cmp(&b.rule_id))
     });
 
+    let deployments = match &options.rpc_url {
+        Some(url) => onchain::resolve(&program_ids, url),
+        None => Vec::new(),
+    };
+
     ScanReport {
         files_scanned,
         test_files_skipped,
@@ -191,6 +212,7 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
         findings,
         skipped,
         program_ids,
+        deployments,
         scan_root: Some(project::normalised(&options.root)),
     }
 }
@@ -250,7 +272,7 @@ pub fn create(ctx: Context<Create>) -> Result<()> {
         fs::write(dir.join("handler.rs"), HANDLER).unwrap();
         fs::write(dir.join("broken.rs"), "fn ( { not rust").unwrap();
 
-        let report = scan(&ScanOptions { root: dir.clone() });
+        let report = scan(&ScanOptions::new(dir.clone()));
 
         assert_eq!(report.files_scanned, 2);
         assert_eq!(report.skipped.len(), 1);
@@ -274,7 +296,7 @@ pub fn create(ctx: Context<Create>) -> Result<()> {
         .unwrap();
         fs::write(dir.join("handler.rs"), HANDLER).unwrap();
 
-        let report = scan(&ScanOptions { root: dir });
+        let report = scan(&ScanOptions::new(dir));
 
         assert!(report.findings.is_empty(), "{:?}", report.findings);
     }
@@ -318,7 +340,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("lib.rs"), source).unwrap();
 
-        let report = scan(&ScanOptions { root: dir });
+        let report = scan(&ScanOptions::new(dir));
 
         // Exactly one finding: the outside call on line 2.
         assert_eq!(
@@ -372,7 +394,7 @@ mod tests {
         // src/unit.rs: M3 file (declared as #[cfg(test)] mod unit;) — finding must be suppressed.
         fs::write(dir.join("src/unit.rs"), CPA).unwrap();
 
-        let report = scan(&ScanOptions { root: dir });
+        let report = scan(&ScanOptions::new(dir));
 
         // Exactly one finding: the call in src/lib.rs.
         assert_eq!(
@@ -412,7 +434,7 @@ pub fn withdraw(vault: &mut Vault, amount: u64) {
         fs::write(dir.join("a.rs"), UNCHECKED_WRITE).unwrap();
         fs::write(dir.join("b.rs"), UNCHECKED_WRITE).unwrap();
 
-        let report = scan(&ScanOptions { root: dir.clone() });
+        let report = scan(&ScanOptions::new(dir.clone()));
 
         let vl003: Vec<_> = report
             .findings
@@ -454,7 +476,7 @@ pub fn withdraw(vault: &mut Vault, amount: u64) {
         fs::write(dir.join("a.rs"), UNCHECKED_WRITE).unwrap();
         fs::write(dir.join("b.rs"), UNCHECKED_WRITE).unwrap();
 
-        let report = scan(&ScanOptions { root: dir });
+        let report = scan(&ScanOptions::new(dir));
 
         let vl003: Vec<_> = report
             .findings
@@ -484,7 +506,7 @@ pub fn withdraw(vault: &mut Vault, amount: u64) {
         )
         .unwrap();
 
-        let report = scan(&ScanOptions { root: dir });
+        let report = scan(&ScanOptions::new(dir));
 
         let vl003: Vec<_> = report
             .findings

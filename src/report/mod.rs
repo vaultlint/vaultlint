@@ -90,6 +90,7 @@ mod tests {
             findings,
             skipped: Vec::<SkippedFile>::new(),
             program_ids: Vec::new(),
+            deployments: Vec::new(),
             scan_root: None,
         }
     }
@@ -278,6 +279,7 @@ mod tests {
             }],
             skipped: vec![],
             program_ids: Vec::new(),
+            deployments: Vec::new(),
             scan_root: None,
         };
         r.scan_root = Some(scan_root.clone());
@@ -319,6 +321,7 @@ mod tests {
             }],
             skipped: vec![],
             program_ids: Vec::new(),
+            deployments: Vec::new(),
             scan_root: None,
         };
         r.scan_root = Some(scan_root.clone());

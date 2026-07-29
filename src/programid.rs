@@ -71,6 +71,33 @@ pub fn is_address(text: &str) -> bool {
 
 const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
+/// Base58 for a 32-byte address read back off the chain.
+pub(crate) fn encode_base58(bytes: &[u8; 32]) -> String {
+    let mut digits: Vec<u8> = Vec::with_capacity(44);
+    for &byte in bytes {
+        let mut carry = u32::from(byte);
+        for digit in digits.iter_mut() {
+            let value = (u32::from(*digit) << 8) + carry;
+            *digit = (value % 58) as u8;
+            carry = value / 58;
+        }
+        while carry > 0 {
+            digits.push((carry % 58) as u8);
+            carry /= 58;
+        }
+    }
+    let leading_zeros = bytes.iter().take_while(|&&b| b == 0).count();
+    let mut out = String::with_capacity(leading_zeros + digits.len());
+    out.extend(std::iter::repeat_n('1', leading_zeros));
+    out.extend(
+        digits
+            .iter()
+            .rev()
+            .map(|&d| char::from(ALPHABET[usize::from(d)])),
+    );
+    out
+}
+
 /// Big-endian base58 decode. `None` when a character is outside the alphabet.
 fn decode_base58(text: &str) -> Option<Vec<u8>> {
     if text.is_empty() || text.len() > 44 {
@@ -181,6 +208,24 @@ mod tests {
     fn a_leading_one_decodes_to_a_zero_byte() {
         assert_eq!(decode_base58("11").unwrap(), vec![0, 0]);
         assert_eq!(decode_base58("1").unwrap(), vec![0]);
+    }
+
+    /// Encoding is the inverse of decoding for the shapes that actually occur:
+    /// an ordinary address, one with a leading zero byte, and the all-zero
+    /// system program.
+    ///
+    /// Kill: drop the leading-zero prefix, or emit the digits in forward order.
+    #[test]
+    fn encoding_round_trips_a_thirty_two_byte_address() {
+        for address in [
+            "M2mx93ekt1fmXSVkTrUL9xVFHkmME8HTUi5Cyc5aF7K",
+            "So11111111111111111111111111111111111111112",
+            "11111111111111111111111111111111",
+            "BPFLoaderUpgradeab1e11111111111111111111111",
+        ] {
+            let bytes: [u8; 32] = decode_base58(address).unwrap().try_into().unwrap();
+            assert_eq!(encode_base58(&bytes), address);
+        }
     }
 
     /// Two programs in one file, and the order is the order they are written.

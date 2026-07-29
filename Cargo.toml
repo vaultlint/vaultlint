@@ -24,3 +24,4 @@ syn = { version = "2", features = ["full", "visit", "extra-traits"] }
 toml = "0.8"
 walkdir = "2"
 quote = "1"
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }

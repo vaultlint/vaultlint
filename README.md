@@ -4,8 +4,8 @@ Security linter for Solana and Anchor programs. It reads your Rust the way an au
 reads it — accounts, seeds, CPIs, math — and reports the file, the line, why it is
 dangerous, and how to fix it.
 
-No AI, no network calls, no telemetry: five hand-written rules that run offline in
-milliseconds.
+No AI, no telemetry, and no network calls unless you ask for one: five hand-written
+rules that run offline in milliseconds.
 
 [![ci](https://github.com/vaultlint/vaultlint/actions/workflows/ci.yml/badge.svg)](https://github.com/vaultlint/vaultlint/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/vaultlint.svg)](https://crates.io/crates/vaultlint)
@@ -53,12 +53,6 @@ $ vaultlint scan ./examples/vulnerable
         Declare the field as `Signer<'info>` if it must authorise the instruction, or bind it to an account whose authority was already proven (`has_one = ...`, `constraint = ...`). If the permissionless designation is intended, suppress the finding.
         https://vaultlint.com/rules/VL001/
 
-⚠ MED  overflow-checks is not enabled
-        Cargo.toml:1
-        This workspace does not set `overflow-checks = true` under `[profile.release]`. Solana programs are built in release mode, so arithmetic that overflows wraps silently instead of aborting the transaction.
-        Add `[profile.release]` with `overflow-checks = true` to the workspace manifest. Overflow then aborts the transaction instead of writing a wrapped value.
-        https://vaultlint.com/rules/VL003/
-
 ⚠ LOW  unchecked arithmetic
         ./examples/vulnerable/unchecked_math.rs:4
         Unchecked subtraction writes into a struct field, and this workspace does not enable `overflow-checks`, so an overflow wraps silently instead of aborting the transaction.
@@ -71,12 +65,38 @@ $ vaultlint scan ./examples/vulnerable
         Enable `overflow-checks` for the release profile, or use `checked_add` / `checked_sub` / `checked_mul` and handle the `None` case.
         https://vaultlint.com/rules/VL003/
 
-7 issues found · 1 high · 4 medium · 2 low
+6 issues found · 1 high · 3 medium · 2 low
 ```
 
 Exit codes make it CI-ready: `0` when nothing exceeds the threshold, `1` when it does,
 `2` on a tool error. The threshold defaults to `high` and is set with
 `--fail-on high|medium|low|never`.
+
+## On chain
+
+`--mainnet` collects every `declare_id!` in the tree and asks Solana what is actually
+deployed at those addresses:
+
+```
+$ vaultlint scan . --mainnet
+→ analyzing 26 Rust files (Anchor 0.29.0) …
+
+→ on chain · 1 declared program id
+  M2mx93ekt1fmXSVkTrUL9xVFHkmME8HTUi5Cyc5aF7K  upgradeable by 9GWPeu3cBfkGSEit6HMaAFKswoirxqgMqykMh7RVH2Bb — last deploy at slot 358179668
+```
+
+Six states are distinguished: no account at the address, an account that is not a
+program, a program under a non-upgradeable loader, an upgradeable program whose
+authority has been revoked, one that is still upgradeable — with the authority and
+the slot of the last deploy — and an address the cluster would not answer about.
+`--rpc-url <URL>` sends the lookup elsewhere and implies `--mainnet`; in JSON the
+section is a `programs` array, present only when the lookup ran.
+
+It reports no findings and cannot change the exit code. Whether an id is deployed is
+a fact about your release process, not a defect in your source: a fresh repository
+and an abandoned one look identical from the source alone, and on fifteen unaudited
+repositories half the undeployed ids were tutorials. So vaultlint prints what the
+cluster said and lets you read it.
 
 ## Rules
 
@@ -155,8 +175,10 @@ say. Reporting it per call site was measured and abandoned — 382 findings acro
 production codebases, not one of them worth acting on. VL003 now asks the question once,
 at the manifest Cargo actually reads `[profile.release]` from, and is completely silent
 on a workspace that already sets the flag. Where it is missing, the arithmetic sites are
-still listed, at Low, as evidence of what would wrap. The same twelve codebases now give
-26 findings across 24 workspace roots, 22 of which say nothing at all.
+still listed, at Low, as evidence of what would wrap — but the question does not wait for
+them. The flag is missing or present regardless of whether a wrapping expression happens
+to be written yet, and on fifteen unaudited repositories six are built without it while
+only one of the six has arithmetic in the shape VL003 recognises.
 
 Which manifest counts is not a detail. Cargo ignores `[profile.*]` in every manifest that
 is not the workspace root, so a member crate setting the flag changes nothing about how
@@ -165,8 +187,10 @@ line that has no effect. vaultlint resolves the root the way Cargo does: the nea
 ancestor manifest declaring `[workspace]`, honouring an explicit `package.workspace`
 pointer and the `workspace.exclude` list. `workspace.members` globs are not matched,
 because a manifest declaring `[workspace]` without listing a package below it makes Cargo
-itself refuse to build. Suppressing the arithmetic sites suppresses the question too: the
-workspace-level finding appears only where at least one unsuppressed site remains.
+itself refuse to build. Two things do keep the question quiet: a workspace with no on-chain
+code in it — no `anchor_lang::prelude`, no `solana_program::entrypoint` — and a root
+manifest that sits above the directory you asked to scan, which belongs to a tree you did
+not ask about.
 
 **VL004 also fires on `create_program_address`, not only on `bump = <arg>`.** The
 table above names the Anchor constraint, but the rule has a second trigger: a direct

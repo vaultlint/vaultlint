@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--mainnet` asks the cluster what is deployed at each declared program id.**
+  Every `declare_id!` in the tree is collected and looked up in two
+  `getMultipleAccounts` calls, and the report gains a section above the findings
+  saying, per address, whether an account exists, whether it is a program, and —
+  for the upgradeable loader — who holds the upgrade authority and at which slot
+  the code was last replaced. `--rpc-url <URL>` points the lookup somewhere other
+  than the public mainnet endpoint and implies `--mainnet`. In JSON the section is
+  a `programs` array, present only when the lookup ran.
+
+  This is context, not a rule: it reports no findings and cannot change the exit
+  code. Measured on fifteen unaudited repositories, six declare an id with nothing
+  deployed behind it, and half of those are tutorials where that is the expected
+  state — too weak a signal to fail a build on. Without the flag vaultlint makes no
+  network calls at all, which stays the default.
+
 ### Changed
 
 - **VL003 reports a missing `overflow-checks` without waiting for arithmetic to
