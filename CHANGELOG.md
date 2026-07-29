@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`VL004` no longer reports a `create_program_address` call whose bump seed is read
+  from account data.** The trigger was unconditional, so it also fired on the fix it
+  recommends — store the canonical bump at init, then derive with `&[stored.bump]`. A
+  rule that reports its own remediation teaches people to ignore it. A caller-supplied
+  `&[nonce]` is still reported, and so is a call whose seeds are assembled elsewhere.
+  The `coral-xyz/anchor` corpus is unchanged: all five of its calls take a bare
+  instruction argument.
 - **`VL002` reports a bare `AccountInfo` parameter at Medium instead of High.** When
   the deserialised account arrives as a helper's `&AccountInfo` argument, whatever the
   caller proved about it is in another function, and VL002 reads one function at a

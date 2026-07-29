@@ -76,29 +76,88 @@ struct DerivationVisitor<'a, 'ctx> {
 
 impl<'ast> Visit<'ast> for DerivationVisitor<'_, '_> {
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-        if let syn::Expr::Path(path) = &*node.func {
-            if path
-                .path
-                .segments
-                .last()
-                .is_some_and(|segment| segment.ident == "create_program_address")
-            {
-                self.out.push(
-                    self.ctx.finding(
-                        "VL004",
-                        Severity::Medium,
-                        "non-canonical PDA bump",
-                        "`create_program_address` accepts any bump, including non-canonical ones."
-                            .to_string(),
-                        "Use `find_program_address`, or compare the result against a stored \
-                     canonical bump before trusting it.",
-                        node.span(),
+        if is_create_program_address(&node.func) {
+            let seed = bump_seed(node);
+            // A bump read out of account data was put there by the program that
+            // owns it, which is the stored-canonical-bump idiom this rule's own
+            // help recommends. Reporting it would make VL004 fire on its own fix.
+            if !seed.is_some_and(reads_stored_value) {
+                let message = match seed {
+                    Some(seed) => format!(
+                        "`{}` is the bump seed given to `create_program_address` and is not read \
+                         from account data, so nothing proves it is the canonical bump. The call \
+                         accepts any bump, and a non-canonical one addresses a different account.",
+                        crate::rules::normalised(seed)
                     ),
-                );
+                    None => "`create_program_address` accepts any bump, including non-canonical \
+                             ones, and this call's bump seed is not written out here, so nothing \
+                             rules one out."
+                        .to_string(),
+                };
+                self.out.push(self.ctx.finding(
+                    "VL004",
+                    Severity::Medium,
+                    "non-canonical PDA bump",
+                    message,
+                    "Use `find_program_address`, or compare the result against a stored \
+                     canonical bump before trusting it.",
+                    node.span(),
+                ));
             }
         }
         visit::visit_expr_call(self, node);
     }
+}
+
+fn is_create_program_address(func: &syn::Expr) -> bool {
+    let syn::Expr::Path(path) = func else {
+        return false;
+    };
+    path.path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "create_program_address")
+}
+
+/// The array literal an expression denotes, through any number of references,
+/// groups and parentheses. `None` when the seeds arrive as a variable.
+fn as_array(expr: &syn::Expr) -> Option<&syn::ExprArray> {
+    match expr {
+        syn::Expr::Array(array) => Some(array),
+        syn::Expr::Reference(reference) => as_array(&reference.expr),
+        syn::Expr::Group(group) => as_array(&group.expr),
+        syn::Expr::Paren(paren) => as_array(&paren.expr),
+        _ => None,
+    }
+}
+
+/// The bump seed of a `create_program_address` call, when the seeds are written
+/// out at the call site: the last seed, if it is a one-element slice. That is
+/// where the bump goes by convention — the other seeds are `&[u8]` of whatever
+/// length, and the bump is the single byte `&[bump]`.
+fn bump_seed(call: &syn::ExprCall) -> Option<&syn::Expr> {
+    let seeds = as_array(call.args.first()?)?;
+    let last = as_array(seeds.elems.last()?)?;
+    if last.elems.len() != 1 {
+        return None;
+    }
+    last.elems.first()
+}
+
+/// True if `expr` reads a field of something — `check.nonce`, `self.bump`,
+/// `state.bump.to_le_bytes()`. This is the same distinction the declarative
+/// half of the rule draws between `bump = user_bump` and `bump = vault.bump`.
+fn reads_stored_value(expr: &syn::Expr) -> bool {
+    struct FieldFinder(bool);
+    impl<'ast> Visit<'ast> for FieldFinder {
+        fn visit_expr_field(&mut self, node: &'ast syn::ExprField) {
+            self.0 = true;
+            visit::visit_expr_field(self, node);
+        }
+    }
+    let mut finder = FieldFinder(false);
+    finder.visit_expr(expr);
+    finder.0
 }
 
 #[cfg(test)]
@@ -239,5 +298,76 @@ mod tests {
 
         assert!(findings.is_empty());
         // Companion: create_program_address IS flagged (see flags_raw_create_program_address).
+    }
+
+    // ── conditional: the bump seed decides ───────────────────────────────────
+
+    /// The shape the rule's own help recommends — store the canonical bump at
+    /// init, then derive with it. Reporting it made VL004 fire on its own fix.
+    ///
+    /// Killing mutation: in `visit_expr_call`, drop the `reads_stored_value`
+    /// guard and report on every `create_program_address`.
+    #[test]
+    fn accepts_a_bump_seed_read_from_account_data() {
+        let findings = findings_for(
+            r#"
+            pub fn check(ctx: &Context<Cash>) -> Result<()> {
+                let signer = Pubkey::create_program_address(
+                    &[ctx.accounts.check.key.as_ref(), &[ctx.accounts.check.nonce]],
+                    ctx.program_id,
+                )?;
+                Ok(())
+            }
+        "#,
+            &UnvalidatedPdaBump,
+        );
+
+        assert!(findings.is_empty());
+    }
+
+    /// The corpus shape: a caller-supplied `u8` fed straight in. This is what
+    /// the rule exists for, and the `reads_stored_value` guard must not reach it.
+    ///
+    /// Killing mutation: in `reads_stored_value`, return `true` unconditionally.
+    #[test]
+    fn flags_a_bare_identifier_bump_seed() {
+        let findings = findings_for(
+            r#"
+            pub fn check(ctx: &Context<Cash>, nonce: u8) -> Result<()> {
+                let signer = Pubkey::create_program_address(
+                    &[ctx.accounts.check.key.as_ref(), &[nonce]],
+                    ctx.program_id,
+                )?;
+                Ok(())
+            }
+        "#,
+            &UnvalidatedPdaBump,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("`nonce`"));
+    }
+
+    /// Only the last seed is the bump. A field access earlier in the list is an
+    /// ordinary seed and says nothing about which bump was used.
+    ///
+    /// Killing mutation: in `bump_seed`, scan the seed array in reverse for the
+    /// first one-element slice instead of reading only the last seed.
+    #[test]
+    fn a_stored_value_in_an_earlier_seed_does_not_silence() {
+        let findings = findings_for(
+            r#"
+            pub fn check(ctx: &Context<Cash>, nonce: u8) -> Result<()> {
+                let signer = Pubkey::create_program_address(
+                    &[&[ctx.accounts.check.nonce], ctx.accounts.check.key.as_ref(), &[nonce]],
+                    ctx.program_id,
+                )?;
+                Ok(())
+            }
+        "#,
+            &UnvalidatedPdaBump,
+        );
+
+        assert_eq!(findings.len(), 1);
     }
 }

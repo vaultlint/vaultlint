@@ -416,6 +416,12 @@ the *recommended* remediation (store the canonical bump at init, then
 that fires on its own fix is a latent false-positive class. Not observed on this
 corpus; recorded so the next measurement looks for it.
 
+> **Fixed after this measurement.** The trigger now reads the call's last seed:
+> a bump taken from account data is silent, a bare identifier is reported, and a
+> call whose seeds are assembled elsewhere is still reported. All five sites in
+> the table above pass a bare instruction argument, so the counts here are
+> unchanged — re-running the reproduction still gives 21.
+
 **No rule fired on a construct it does not name.** Every one of the 21 findings
 was checked against its own message text and none misdescribed what was on the
 line. The two disagreements above are both scope limits, not misfires.

@@ -168,6 +168,16 @@ because a manifest declaring `[workspace]` without listing a package below it ma
 itself refuse to build. Suppressing the arithmetic sites suppresses the question too: the
 workspace-level finding appears only where at least one unsuppressed site remains.
 
+**VL004 also fires on `create_program_address`, not only on `bump = <arg>`.** The
+table above names the Anchor constraint, but the rule has a second trigger: a direct
+`Pubkey::create_program_address` call, which unlike `find_program_address` accepts any
+bump you hand it. Which bump you hand it is what decides the finding. A bump read out
+of account data — `&[check.nonce]`, `&[self.bump]` — is the stored-canonical-bump
+idiom the rule recommends, and is silent. A bare identifier — `&[nonce]`, the caller's
+`u8` — is reported, and so is a call whose seeds are assembled elsewhere, where the
+bump cannot be read at the call site. Only the last seed is examined, because that is
+where the bump goes.
+
 **VL005 does not flag every unverified `invoke`.** It flags a CPI whose `Instruction`
 was built in that same function body and whose `program_id` came from an account —
 the only shape where a developer has something to verify. A CPI built by an SDK
