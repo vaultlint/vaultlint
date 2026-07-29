@@ -64,6 +64,7 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
     let mut index = UseSiteIndex::empty();
     let mut linked_files = Vec::new();
     let mut roots_without_overflow_checks: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut onchain_roots: BTreeSet<PathBuf> = BTreeSet::new();
 
     // Collect all candidate files first so M3 can be resolved across the tree.
     let all_files = scan::rust_files(&options.root);
@@ -102,14 +103,12 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
                         && !scope::in_test_range(finding.line, &test_ranges)
                 });
 
-                if !workspace.overflow_checks {
-                    if let Some(manifest) = &workspace.manifest {
-                        if file_findings
-                            .iter()
-                            .any(|finding| finding.rule_id == "VL003")
-                        {
-                            roots_without_overflow_checks.insert(manifest.clone());
-                        }
+                if let Some(manifest) = &workspace.manifest {
+                    if is_onchain_source(&file.source) {
+                        onchain_roots.insert(manifest.clone());
+                    }
+                    if !workspace.overflow_checks {
+                        roots_without_overflow_checks.insert(manifest.clone());
                     }
                 }
 
@@ -127,8 +126,13 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
         }
     }
 
-    for manifest in &roots_without_overflow_checks {
-        findings.push(rules::arithmetic::overflow_checks_finding(manifest));
+    // A manifest above the scan root belongs to a tree the caller did not ask
+    // about, so reporting it would be noise on a subdirectory scan.
+    let scan_root = project::normalised(&options.root);
+    for manifest in roots_without_overflow_checks.intersection(&onchain_roots) {
+        if project::normalised(manifest).starts_with(&scan_root) {
+            findings.push(rules::arithmetic::overflow_checks_finding(manifest));
+        }
     }
 
     // Phase 2: only files declaring an `Accounts` struct can produce a linked
@@ -176,6 +180,14 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
         skipped,
         scan_root: Some(project::normalised(&options.root)),
     }
+}
+
+/// Whether a source file is on-chain program code rather than a client crate or
+/// an unrelated Rust workspace. VL003 is about release-mode arithmetic in a
+/// deployed program, so the manifest finding only applies to a tree that holds
+/// one.
+fn is_onchain_source(source: &str) -> bool {
+    source.contains("anchor_lang::prelude") || source.contains("solana_program::entrypoint")
 }
 
 pub fn version() -> &'static str {
@@ -325,10 +337,12 @@ mod tests {
         fs::create_dir_all(dir.join("src")).unwrap();
         fs::create_dir_all(dir.join("tests")).unwrap();
 
-        // Minimal Cargo.toml so M1 can find the crate root.
+        // Minimal Cargo.toml so M1 can find the crate root. `overflow-checks` is
+        // on so VL003 stays out of a test about test-file scoping.
         fs::write(
             dir.join("Cargo.toml"),
-            "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [profile.release]\noverflow-checks = true\n",
         )
         .unwrap();
 
@@ -363,6 +377,8 @@ mod tests {
     }
 
     const UNCHECKED_WRITE: &str = "\
+use anchor_lang::prelude::*;
+
 pub fn withdraw(vault: &mut Vault, amount: u64) {
     vault.balance = vault.balance - amount;
 }
@@ -433,6 +449,42 @@ pub fn withdraw(vault: &mut Vault, amount: u64) {
             .filter(|f| f.rule_id == "VL003")
             .collect();
         assert!(vl003.is_empty(), "expected no VL003 findings: {:?}", vl003);
+    }
+
+    /// A workspace with no `overflow-checks` and no arithmetic VL003 recognises
+    /// still reports the manifest. Measured against 15 unaudited trees, six built
+    /// without overflow checks and only one had per-op arithmetic to hang the
+    /// report on, so gating the manifest finding on a per-op finding silenced it
+    /// in five of six.
+    ///
+    /// Kill: restore the `file_findings.iter().any(|f| f.rule_id == "VL003")`
+    /// condition around the `roots_without_overflow_checks` insert.
+    #[test]
+    fn reports_missing_overflow_checks_without_any_arithmetic_finding() {
+        let dir = std::env::temp_dir().join("vaultlint_vl003_no_arithmetic");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        fs::write(
+            dir.join("a.rs"),
+            "use anchor_lang::prelude::*;\n\npub fn label() -> &'static str {\n    \"ok\"\n}\n",
+        )
+        .unwrap();
+
+        let report = scan(&ScanOptions { root: dir });
+
+        let vl003: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "VL003")
+            .collect();
+        assert_eq!(vl003.len(), 1, "expected the manifest finding: {vl003:?}");
+        assert_eq!(vl003[0].severity, crate::finding::Severity::Medium);
+        assert!(
+            vl003[0].file.ends_with("Cargo.toml"),
+            "must point at the manifest, got {:?}",
+            vl003[0].file
+        );
     }
 
     /// Two distinct rules fire on a single source file: VL004 fires on

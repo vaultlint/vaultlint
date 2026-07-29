@@ -94,7 +94,10 @@ fn every_vulnerable_example_is_detected_at_the_expected_line() {
             "examples/vulnerable/missing_owner.rs".to_string(),
             5,
         ),
-        ("VL003".to_string(), "Cargo.toml".to_string(), 1),
+        // No manifest-level VL003: the workspace root that lacks
+        // `overflow-checks` is vaultlint's own, which sits above the scanned
+        // directory. The per-op findings below still see `overflow_checks =
+        // false` from it.
         (
             "VL003".to_string(),
             "examples/vulnerable/unchecked_math.rs".to_string(),

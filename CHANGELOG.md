@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **VL003 reports a missing `overflow-checks` without waiting for arithmetic to
+  point at.** The project-level finding used to be emitted only for a workspace
+  that also produced at least one Low arithmetic site. Measured against fifteen
+  unaudited Solana repositories, six are built without overflow checks and only
+  one of the six has arithmetic in the shape VL003 recognises — so the gate
+  silenced the finding in five cases out of six, and the setting is wrong in all
+  six regardless of whether a wrapping expression happens to be written yet.
+  Two narrowings replace it: the workspace must contain on-chain code
+  (`anchor_lang::prelude` or `solana_program::entrypoint`), and the manifest must
+  lie inside the directory that was scanned. A consequence worth stating: the
+  project finding can no longer be silenced by suppressing every arithmetic site.
+
 ## [0.1.1] — 2026-07-29
 
 ### Added
