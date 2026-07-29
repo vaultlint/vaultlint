@@ -186,7 +186,7 @@ pub fn version() -> &'static str {
 mod tests {
     #[test]
     fn version_is_reported() {
-        assert_eq!(super::version(), "0.1.0");
+        assert_eq!(super::version(), "0.1.1");
     }
 }
 

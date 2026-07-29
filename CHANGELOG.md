@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-07-29
+
 ### Added
 
 - **The human report prints each finding's documentation URL.** It was already in
@@ -93,5 +95,6 @@ First public release.
   positive rate was acceptable; the measurements are recorded in `docs/measurements/`.
 - VaultLint complements a manual audit rather than replacing one.
 
-[Unreleased]: https://github.com/vaultlint/vaultlint/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/vaultlint/vaultlint/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/vaultlint/vaultlint/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/vaultlint/vaultlint/releases/tag/v0.1.0
