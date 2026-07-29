@@ -9,10 +9,12 @@
 //! whole repository — and every decision about what an account *means* lives in
 //! a pure function below, where it can be tested without a network.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
+use crate::depgraph::DepGraph;
 use crate::finding::Finding;
 use crate::programid::{encode_base58, DeclaredId};
 use crate::project::{self, WorkspaceResolver};
@@ -72,33 +74,36 @@ impl State {
     }
 }
 
-/// Marks each finding with the live program ids that its own crate declares —
-/// or, for a finding reported against a manifest, that its whole workspace does.
+/// Marks each finding with the live program ids whose code it is part of.
 ///
 /// The two halves are useless apart. A block explorer can say the program at
 /// this address is running and has never read the manifest that built it; a
 /// linter can say the manifest is wrong and has no idea whether anything was
 /// ever deployed. Only the join says: *this defect is in code that is running.*
 ///
-/// A manifest-level finding takes the workspace scope deliberately. VL003 is
-/// reported against the workspace root because that is the file Cargo reads the
-/// profile from, and every crate under that root is built with the flag it is
-/// missing — so every live program under it is affected, not just one.
+/// "Part of" is the path-dependency closure below the program's own crate, not
+/// that crate alone: a shared library declares no id and its arithmetic executes
+/// on chain regardless. A manifest-level finding instead takes the workspace
+/// scope, because Cargo reads `[profile.release]` from the root and builds every
+/// crate under it with the flag that is missing.
 pub(crate) fn annotate(
     findings: &mut [Finding],
     deployments: &[Deployment],
     resolver: &WorkspaceResolver,
 ) {
-    let live: Vec<(&Deployment, Option<PathBuf>, Option<PathBuf>)> = deployments
+    let mut graph = DepGraph::new(resolver);
+    let live: Vec<(&Deployment, BTreeSet<PathBuf>, Option<PathBuf>)> = deployments
         .iter()
         .filter(|d| d.state.is_live())
         .map(|d| {
-            let package = project::package_manifest(&d.declared.file);
+            let compiled_in = project::package_manifest(&d.declared.file)
+                .map(|manifest| graph.closure(&manifest))
+                .unwrap_or_default();
             let workspace = resolver
                 .resolve(&d.declared.file)
                 .manifest
                 .map(|m| project::normalised(&m));
-            (d, package, workspace)
+            (d, compiled_in, workspace)
         })
         .collect();
     if live.is_empty() {
@@ -116,9 +121,12 @@ pub(crate) fn annotate(
         let Some(scope) = scope else { continue };
         finding.live_at = live
             .iter()
-            .filter(|(_, package, workspace)| {
-                let owner = if is_manifest { workspace } else { package };
-                owner.as_deref() == Some(scope.as_path())
+            .filter(|(_, compiled_in, workspace)| {
+                if is_manifest {
+                    workspace.as_deref() == Some(scope.as_path())
+                } else {
+                    compiled_in.contains(&scope)
+                }
             })
             .map(|(d, _, _)| d.declared.address.clone())
             .collect();
@@ -558,32 +566,38 @@ mod tests {
     }
 
     /// The join is only worth making if it discriminates. A finding must carry
-    /// the id its own crate declares, must not carry a sibling crate's, and a
-    /// crate that declares nothing live must stay unmarked — otherwise "live on
-    /// mainnet" degrades into a label every finding wears.
+    /// the id of every live program its code is compiled into — including through
+    /// a shared library that declares no id at all — and must carry nothing else,
+    /// or "live on mainnet" degrades into a label every finding wears.
     ///
     /// The manifest finding is the deliberate exception: Cargo reads the profile
     /// from the workspace root, so every live program under that root is built
     /// with the missing flag.
     ///
-    /// Kill: give every finding the whole live list, or swap the package and
-    /// workspace scopes.
+    /// Kill: give every finding the whole live list, use the declaring crate
+    /// instead of its dependency closure, or swap the package and workspace scopes.
     #[test]
-    fn a_finding_carries_only_its_own_crates_live_ids() {
+    fn a_finding_carries_the_live_programs_its_code_is_part_of() {
         let dir = std::env::temp_dir().join("vaultlint_onchain_annotate");
         let _ = std::fs::remove_dir_all(&dir);
-        for member in ["live", "dead"] {
+        for member in ["live", "dead", "shared"] {
             std::fs::create_dir_all(dir.join(member).join("src")).unwrap();
-            std::fs::write(
-                dir.join(member).join("Cargo.toml"),
-                format!("[package]\nname = \"{member}\"\n"),
-            )
-            .unwrap();
             std::fs::write(dir.join(member).join("src/lib.rs"), "").unwrap();
         }
         std::fs::write(
             dir.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"live\", \"dead\"]\n",
+            "[workspace]\nmembers = [\"live\", \"dead\", \"shared\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("live/Cargo.toml"),
+            "[package]\nname = \"live\"\n\n[dependencies]\nshared = { path = \"../shared\" }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("dead/Cargo.toml"), "[package]\nname = \"dead\"\n").unwrap();
+        std::fs::write(
+            dir.join("shared/Cargo.toml"),
+            "[package]\nname = \"shared\"\n",
         )
         .unwrap();
 
@@ -601,6 +615,7 @@ mod tests {
         let mut findings = vec![
             finding_at(&dir.join("live/src/lib.rs")),
             finding_at(&dir.join("dead/src/lib.rs")),
+            finding_at(&dir.join("shared/src/lib.rs")),
             finding_at(&dir.join("Cargo.toml")),
         ];
 
@@ -611,6 +626,11 @@ mod tests {
         assert!(findings[1].live_at.is_empty(), "GONE is not deployed");
         assert_eq!(
             findings[2].live_at,
+            ["LIVE"],
+            "shared declares no id but is compiled into the live program"
+        );
+        assert_eq!(
+            findings[3].live_at,
             ["LIVE"],
             "the manifest finding takes the whole workspace"
         );

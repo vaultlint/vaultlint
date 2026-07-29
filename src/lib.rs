@@ -1,4 +1,5 @@
 pub(crate) mod anchor;
+pub(crate) mod depgraph;
 pub mod finding;
 pub mod onchain;
 pub(crate) mod parse;

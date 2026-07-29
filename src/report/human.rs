@@ -130,10 +130,10 @@ fn describe(state: &State) -> String {
 }
 
 /// The sentence that turns a finding about a repository into a finding about a
-/// running program, or `None` when nothing the crate declares is live.
+/// running program, or `None` when no live program was found to contain it.
 ///
 /// One address is named because naming it is the whole point — the reader can
-/// paste it into an explorer. Beyond two, the list stops being readable and the
+/// paste it into an explorer. Beyond one, the list stops being readable and the
 /// count carries the claim instead; the on-chain section above has already
 /// spelled every address out once, so nothing is lost.
 fn live_at(addresses: &[String]) -> Option<String> {
@@ -141,7 +141,7 @@ fn live_at(addresses: &[String]) -> Option<String> {
         [] => None,
         [one] => Some(format!("live on mainnet at {one}")),
         [first, rest @ ..] => Some(format!(
-            "live on mainnet at {first} and {} more declared here",
+            "live on mainnet at {first} and {} more",
             rest.len()
         )),
     }
@@ -298,7 +298,7 @@ mod tests {
         );
         assert_eq!(
             live_at(&["M2mx".to_string(), "GTuv".to_string(), "Time".to_string()]).unwrap(),
-            "live on mainnet at M2mx and 2 more declared here"
+            "live on mainnet at M2mx and 2 more"
         );
     }
 

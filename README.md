@@ -114,20 +114,29 @@ has never read the manifest that built it; a linter reads the manifest and has n
 whether anything was ever deployed. The conjunction — *this defect is in code that is
 executing at this address right now* — is the claim, and it is why the flag exists.
 
-A finding takes the ids **its own crate** declares; a finding reported against a
-manifest takes the whole workspace's, because Cargo reads `[profile.release]` from the
-root and builds every crate under it with the flag that is missing. On the fifteen
-repositories, 16 of 24 findings are in live code and 8 findings are not — the mark
-separates rather than decorates.
+A finding is marked with an address when its crate is **compiled into** the program
+deployed there — the path-dependency closure below that program's crate, not the crate
+alone. A shared library declares no id of its own and its arithmetic still executes on
+chain, so following `path` dependencies is what makes the mark mean anything: on
+`mpl-account-compression` it is the difference between marking 1 finding and 5. Both
+ways of naming a local crate are followed, an inline `path = "…"` and an inherited
+`{ workspace = true }`, and transitively.
+
+A finding reported against a manifest is the exception: it takes the whole workspace's
+live ids, because Cargo reads `[profile.release]` from the root and builds every crate
+under it with the flag that is missing.
 
 Severity is deliberately unchanged. The exit code has to be a function of your source
 alone, or the same commit passes CI today and fails tomorrow because an RPC endpoint
 was slow. The mark tells you which findings to open first; it does not decide for you.
 
-Its limit, stated plainly: the link is a crate that declares an id, so a shared library
-compiled *into* a live program is not marked. That code does run on mainnet. Following
-path dependencies would catch it and is not implemented, so read an unmarked finding as
-"not shown to be live", never as "not live".
+Two things are deliberately not followed, and both make the mark conservative rather
+than generous. `dev-dependencies` and `build-dependencies` never reach the cluster. An
+`optional = true` dependency is skipped, because whether it is compiled in depends on
+which features the build turns on and a manifest alone does not say. So read an
+unmarked finding as "not shown to be live", never as "not live". Across the fifteen
+repositories 21 of 24 findings are marked; the 3 that are not sit behind program ids
+with nothing deployed at them.
 
 ## Rules
 

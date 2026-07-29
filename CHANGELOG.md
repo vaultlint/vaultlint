@@ -27,17 +27,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Findings in code that is actually running are marked `live on mainnet at
   <address>`.** Neither half of that can be said alone — a block explorer never read
   the manifest, a linter never asked the cluster — and the conjunction is the point:
-  *this defect is in code executing at this address right now.* A finding takes the
-  ids its own crate declares; a finding reported against a manifest takes the whole
-  workspace's, because Cargo builds every crate under that root with the profile it
-  is missing. On the fifteen repositories 16 of 24 findings are marked and 8 are not,
-  so the mark separates rather than decorates.
+  *this defect is in code executing at this address right now.* A finding is marked
+  when its crate is compiled into the program deployed there — the path-dependency
+  closure below that program's crate, following both an inline `path = "…"` and an
+  inherited `{ workspace = true }`, transitively. A shared library declares no id and
+  its arithmetic runs on chain regardless; on `mpl-account-compression` that closure
+  is the difference between marking 1 finding and 5. A finding reported against a
+  manifest instead takes the whole workspace's ids, because Cargo builds every crate
+  under that root with the profile it is missing.
 
   Severity is unchanged on purpose. The exit code must be a function of the source
   alone, or the same commit passes CI today and fails tomorrow because an endpoint
-  was slow. The link is also conservative: a shared library compiled into a live
-  program is not marked, so an unmarked finding means "not shown to be live", not
-  "not live".
+  was slow. The link is conservative: `dev-dependencies`, `build-dependencies` and
+  `optional = true` dependencies are not followed, the last because a manifest does
+  not say which features a build turns on. An unmarked finding means "not shown to be
+  live", not "not live". Across the fifteen repositories 21 of 24 findings are marked;
+  the 3 that are not sit behind program ids with nothing deployed at them.
 
   `Finding` gains a `live_at` field, omitted from JSON when empty; SARIF appends the
   sentence to `message.text`, which is what GitHub's Security tab renders.
