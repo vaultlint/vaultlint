@@ -18,11 +18,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than the public mainnet endpoint and implies `--mainnet`. In JSON the section is
   a `programs` array, present only when the lookup ran.
 
-  This is context, not a rule: it reports no findings and cannot change the exit
-  code. Measured on fifteen unaudited repositories, six declare an id with nothing
-  deployed behind it, and half of those are tutorials where that is the expected
-  state — too weak a signal to fail a build on. Without the flag vaultlint makes no
-  network calls at all, which stays the default.
+  This is context, not a rule: it reports no findings of its own and cannot change
+  the exit code. Measured on fifteen unaudited repositories, six declare an id with
+  nothing deployed behind it, and half of those are tutorials where that is the
+  expected state — too weak a signal to fail a build on. Without the flag vaultlint
+  makes no network calls at all, which stays the default.
+
+- **Findings in code that is actually running are marked `live on mainnet at
+  <address>`.** Neither half of that can be said alone — a block explorer never read
+  the manifest, a linter never asked the cluster — and the conjunction is the point:
+  *this defect is in code executing at this address right now.* A finding takes the
+  ids its own crate declares; a finding reported against a manifest takes the whole
+  workspace's, because Cargo builds every crate under that root with the profile it
+  is missing. On the fifteen repositories 16 of 24 findings are marked and 8 are not,
+  so the mark separates rather than decorates.
+
+  Severity is unchanged on purpose. The exit code must be a function of the source
+  alone, or the same commit passes CI today and fails tomorrow because an endpoint
+  was slow. The link is also conservative: a shared library compiled into a live
+  program is not marked, so an unmarked finding means "not shown to be live", not
+  "not live".
+
+  `Finding` gains a `live_at` field, omitted from JSON when empty; SARIF appends the
+  sentence to `message.text`, which is what GitHub's Security tab renders.
 
 ### Changed
 

@@ -79,4 +79,12 @@ pub struct Finding {
     pub snippet: String,
     pub help: Cow<'static, str>,
     pub docs_url: String,
+    /// Program ids declared by the same crate — or, for a project-level finding,
+    /// anywhere in the same workspace — that hold a live program on the cluster.
+    ///
+    /// This is the claim neither half of the tool can make alone: a block explorer
+    /// never read the manifest, and a linter never asked the cluster. Empty unless
+    /// [`ScanOptions::rpc_url`](crate::ScanOptions::rpc_url) was set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub live_at: Vec<String>,
 }

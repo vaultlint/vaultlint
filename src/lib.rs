@@ -204,6 +204,7 @@ pub fn scan(options: &ScanOptions) -> ScanReport {
         Some(url) => onchain::resolve(&program_ids, url),
         None => Vec::new(),
     };
+    onchain::annotate(&mut findings, &deployments, &workspace_resolver);
 
     ScanReport {
         files_scanned,

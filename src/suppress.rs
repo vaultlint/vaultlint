@@ -140,6 +140,7 @@ mod tests {
             snippet: String::new(),
             help: std::borrow::Cow::Borrowed("test help"),
             docs_url: String::new(),
+            live_at: Vec::new(),
         }
     }
 

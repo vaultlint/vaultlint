@@ -92,11 +92,42 @@ the slot of the last deploy — and an address the cluster would not answer abou
 `--rpc-url <URL>` sends the lookup elsewhere and implies `--mainnet`; in JSON the
 section is a `programs` array, present only when the lookup ran.
 
-It reports no findings and cannot change the exit code. Whether an id is deployed is
-a fact about your release process, not a defect in your source: a fresh repository
-and an abandoned one look identical from the source alone, and on fifteen unaudited
-repositories half the undeployed ids were tutorials. So vaultlint prints what the
-cluster said and lets you read it.
+It reports no findings of its own and cannot change the exit code. Whether an id is
+deployed is a fact about your release process, not a defect in your source: a fresh
+repository and an abandoned one look identical from the source alone, and on fifteen
+unaudited repositories half the undeployed ids were tutorials. So vaultlint prints
+what the cluster said and lets you read it.
+
+What it does do is mark the findings that are **in code which is running**:
+
+```
+⚠ MED  overflow-checks is not enabled
+        Cargo.toml:6
+        This workspace does not set `overflow-checks = true` under `[profile.release]`. …
+        Add `[profile.release]` with `overflow-checks = true` to the workspace manifest. …
+        live on mainnet at M2mx93ekt1fmXSVkTrUL9xVFHkmME8HTUi5Cyc5aF7K
+        https://vaultlint.com/rules/VL003/
+```
+
+Neither half of that can be said alone. A block explorer sees the program running and
+has never read the manifest that built it; a linter reads the manifest and has no idea
+whether anything was ever deployed. The conjunction — *this defect is in code that is
+executing at this address right now* — is the claim, and it is why the flag exists.
+
+A finding takes the ids **its own crate** declares; a finding reported against a
+manifest takes the whole workspace's, because Cargo reads `[profile.release]` from the
+root and builds every crate under it with the flag that is missing. On the fifteen
+repositories, 16 of 24 findings are in live code and 8 findings are not — the mark
+separates rather than decorates.
+
+Severity is deliberately unchanged. The exit code has to be a function of your source
+alone, or the same commit passes CI today and fails tomorrow because an RPC endpoint
+was slow. The mark tells you which findings to open first; it does not decide for you.
+
+Its limit, stated plainly: the link is a crate that declares an id, so a shared library
+compiled *into* a live program is not marked. That code does run on mainnet. Following
+path dependencies would catch it and is not implemented, so read an unmarked finding as
+"not shown to be live", never as "not live".
 
 ## Rules
 

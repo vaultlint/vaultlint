@@ -115,6 +115,7 @@ fn finding_at(
         snippet,
         help: std::borrow::Cow::Borrowed(help),
         docs_url: format!("https://vaultlint.com/rules/{rule_id}/"),
+        live_at: Vec::new(),
     }
 }
 

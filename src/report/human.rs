@@ -56,6 +56,9 @@ pub fn render(report: &ScanReport, out: &mut dyn Write, colour: bool) -> std::io
         writeln!(out, "        {}:{}", finding.file.display(), finding.line)?;
         writeln!(out, "        {}", finding.message)?;
         writeln!(out, "        {}", finding.help)?;
+        if let Some(live) = live_at(&finding.live_at) {
+            writeln!(out, "        {}", emphasise(&live, colour))?;
+        }
         writeln!(out, "        {}", link(&finding.docs_url, colour))?;
     }
 
@@ -126,6 +129,32 @@ fn describe(state: &State) -> String {
     }
 }
 
+/// The sentence that turns a finding about a repository into a finding about a
+/// running program, or `None` when nothing the crate declares is live.
+///
+/// One address is named because naming it is the whole point — the reader can
+/// paste it into an explorer. Beyond two, the list stops being readable and the
+/// count carries the claim instead; the on-chain section above has already
+/// spelled every address out once, so nothing is lost.
+fn live_at(addresses: &[String]) -> Option<String> {
+    match addresses {
+        [] => None,
+        [one] => Some(format!("live on mainnet at {one}")),
+        [first, rest @ ..] => Some(format!(
+            "live on mainnet at {first} and {} more declared here",
+            rest.len()
+        )),
+    }
+}
+
+fn emphasise(text: &str, colour: bool) -> String {
+    if colour {
+        text.bold().to_string()
+    } else {
+        text.to_string()
+    }
+}
+
 /// The rule's documentation page. It is also the only place the human report
 /// spells the rule id, which is what a `// vaultlint:allow VL002` comment
 /// needs — the alternative, a column of ids in the heading, would say the same
@@ -189,6 +218,7 @@ mod tests {
                 snippet: String::new(),
                 help: "help".into(),
                 docs_url: "https://vaultlint.com/rules/VL002/".to_string(),
+                live_at: Vec::new(),
             }],
             skipped: Vec::new(),
             program_ids: Vec::new(),
@@ -252,6 +282,24 @@ mod tests {
         assert_eq!(unique.len(), lines.len(), "{lines:?}");
         assert!(lines[4].contains("AUTH") && lines[4].contains('2'));
         assert!(lines[5].contains("timeout"));
+    }
+
+    /// A finding in code nobody deployed must not be dressed as one in code that
+    /// is running, and the address has to be named — "somewhere on mainnet" is
+    /// not something a reader can check.
+    ///
+    /// Kill: print the line for an empty `live_at`, or drop the address from it.
+    #[test]
+    fn the_live_line_names_an_address_and_appears_only_when_there_is_one() {
+        assert_eq!(live_at(&[]), None);
+        assert_eq!(
+            live_at(&["M2mx".to_string()]).unwrap(),
+            "live on mainnet at M2mx"
+        );
+        assert_eq!(
+            live_at(&["M2mx".to_string(), "GTuv".to_string(), "Time".to_string()]).unwrap(),
+            "live on mainnet at M2mx and 2 more declared here"
+        );
     }
 
     /// Piped output must stay free of escape sequences — CI logs and `grep` see

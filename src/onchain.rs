@@ -9,9 +9,13 @@
 //! whole repository — and every decision about what an account *means* lives in
 //! a pure function below, where it can be tested without a network.
 
+use std::path::PathBuf;
+
 use serde_json::{json, Value};
 
+use crate::finding::Finding;
 use crate::programid::{encode_base58, DeclaredId};
+use crate::project::{self, WorkspaceResolver};
 
 const UPGRADEABLE_LOADER: &str = "BPFLoaderUpgradeab1e11111111111111111111111";
 const LOADER_V1: &str = "BPFLoader1111111111111111111111111111111111";
@@ -52,6 +56,73 @@ pub enum State {
     /// The cluster could not be asked. Never conflated with `Absent`: not
     /// knowing and knowing there is nothing there are different answers.
     Unavailable { reason: String },
+}
+
+impl State {
+    /// Whether code is executing at this address right now.
+    ///
+    /// `Immutable` and `Frozen` count: a defect that can no longer be patched is
+    /// running no less than one that can. `Unavailable` does not — an unanswered
+    /// question must never be reported as a fact.
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self,
+            State::Immutable | State::Frozen { .. } | State::Upgradeable { .. }
+        )
+    }
+}
+
+/// Marks each finding with the live program ids that its own crate declares —
+/// or, for a finding reported against a manifest, that its whole workspace does.
+///
+/// The two halves are useless apart. A block explorer can say the program at
+/// this address is running and has never read the manifest that built it; a
+/// linter can say the manifest is wrong and has no idea whether anything was
+/// ever deployed. Only the join says: *this defect is in code that is running.*
+///
+/// A manifest-level finding takes the workspace scope deliberately. VL003 is
+/// reported against the workspace root because that is the file Cargo reads the
+/// profile from, and every crate under that root is built with the flag it is
+/// missing — so every live program under it is affected, not just one.
+pub(crate) fn annotate(
+    findings: &mut [Finding],
+    deployments: &[Deployment],
+    resolver: &WorkspaceResolver,
+) {
+    let live: Vec<(&Deployment, Option<PathBuf>, Option<PathBuf>)> = deployments
+        .iter()
+        .filter(|d| d.state.is_live())
+        .map(|d| {
+            let package = project::package_manifest(&d.declared.file);
+            let workspace = resolver
+                .resolve(&d.declared.file)
+                .manifest
+                .map(|m| project::normalised(&m));
+            (d, package, workspace)
+        })
+        .collect();
+    if live.is_empty() {
+        return;
+    }
+
+    for finding in findings {
+        let is_manifest = finding.file.file_name().is_some_and(|n| n == "Cargo.toml");
+        let scope = project::normalised(&finding.file);
+        let scope = if is_manifest {
+            Some(scope)
+        } else {
+            project::package_manifest(&finding.file)
+        };
+        let Some(scope) = scope else { continue };
+        finding.live_at = live
+            .iter()
+            .filter(|(_, package, workspace)| {
+                let owner = if is_manifest { workspace } else { package };
+                owner.as_deref() == Some(scope.as_path())
+            })
+            .map(|(d, _, _)| d.declared.address.clone())
+            .collect();
+    }
 }
 
 /// Looks up every declared id on the cluster at `rpc_url`.
@@ -468,5 +539,103 @@ mod tests {
             }
         }
         out
+    }
+
+    fn deployment(file: &std::path::Path, address: &str, state: State) -> Deployment {
+        Deployment {
+            declared: DeclaredId {
+                address: address.to_string(),
+                file: file.to_path_buf(),
+                line: 1,
+                column: 1,
+            },
+            state,
+        }
+    }
+
+    fn finding_at(file: &std::path::Path) -> Finding {
+        crate::rules::arithmetic::overflow_checks_finding(file)
+    }
+
+    /// The join is only worth making if it discriminates. A finding must carry
+    /// the id its own crate declares, must not carry a sibling crate's, and a
+    /// crate that declares nothing live must stay unmarked — otherwise "live on
+    /// mainnet" degrades into a label every finding wears.
+    ///
+    /// The manifest finding is the deliberate exception: Cargo reads the profile
+    /// from the workspace root, so every live program under that root is built
+    /// with the missing flag.
+    ///
+    /// Kill: give every finding the whole live list, or swap the package and
+    /// workspace scopes.
+    #[test]
+    fn a_finding_carries_only_its_own_crates_live_ids() {
+        let dir = std::env::temp_dir().join("vaultlint_onchain_annotate");
+        let _ = std::fs::remove_dir_all(&dir);
+        for member in ["live", "dead"] {
+            std::fs::create_dir_all(dir.join(member).join("src")).unwrap();
+            std::fs::write(
+                dir.join(member).join("Cargo.toml"),
+                format!("[package]\nname = \"{member}\"\n"),
+            )
+            .unwrap();
+            std::fs::write(dir.join(member).join("src/lib.rs"), "").unwrap();
+        }
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"live\", \"dead\"]\n",
+        )
+        .unwrap();
+
+        let deployments = vec![
+            deployment(
+                &dir.join("live/src/lib.rs"),
+                "LIVE",
+                State::Upgradeable {
+                    authority: "AUTH".to_string(),
+                    last_deploy_slot: 1,
+                },
+            ),
+            deployment(&dir.join("dead/src/lib.rs"), "GONE", State::Absent),
+        ];
+        let mut findings = vec![
+            finding_at(&dir.join("live/src/lib.rs")),
+            finding_at(&dir.join("dead/src/lib.rs")),
+            finding_at(&dir.join("Cargo.toml")),
+        ];
+
+        let resolver = WorkspaceResolver::new(&dir);
+        annotate(&mut findings, &deployments, &resolver);
+
+        assert_eq!(findings[0].live_at, ["LIVE"]);
+        assert!(findings[1].live_at.is_empty(), "GONE is not deployed");
+        assert_eq!(
+            findings[2].live_at,
+            ["LIVE"],
+            "the manifest finding takes the whole workspace"
+        );
+    }
+
+    /// An unanswered question is not a fact. A transport failure marks ids
+    /// `Unavailable`, and marking those findings "live on mainnet" would state
+    /// something the scan never learned.
+    ///
+    /// Kill: make `is_live` true for anything that is not `Absent`.
+    #[test]
+    fn an_unanswered_lookup_never_reads_as_live() {
+        assert!(!State::Absent.is_live());
+        assert!(!State::Unavailable {
+            reason: "timeout".to_string()
+        }
+        .is_live());
+        assert!(!State::NotAProgram {
+            owner: "Tokenkeg".to_string()
+        }
+        .is_live());
+        assert!(State::Immutable.is_live(), "code that can never be patched");
+        assert!(State::Frozen {
+            last_deploy_slot: 1
+        }
+        .is_live());
     }
 }

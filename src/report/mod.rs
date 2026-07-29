@@ -79,6 +79,7 @@ mod tests {
             snippet: "pub authority: AccountInfo<'info>,".to_string(),
             help: Cow::Borrowed("Use `Account<'info, T>`, which checks the owner."),
             docs_url: "https://vaultlint.com/rules/VL002/".to_string(),
+            live_at: Vec::new(),
         }
     }
 
@@ -276,6 +277,7 @@ mod tests {
                 snippet: String::new(),
                 help: Cow::Borrowed("fix it"),
                 docs_url: "https://vaultlint.com/rules/VL002/".to_string(),
+                live_at: Vec::new(),
             }],
             skipped: vec![],
             program_ids: Vec::new(),
@@ -318,6 +320,7 @@ mod tests {
                 snippet: String::new(),
                 help: Cow::Borrowed("fix it"),
                 docs_url: "https://vaultlint.com/rules/VL003/".to_string(),
+                live_at: Vec::new(),
             }],
             skipped: vec![],
             program_ids: Vec::new(),
@@ -359,6 +362,7 @@ mod tests {
             snippet: String::new(),
             help: Cow::Borrowed("use checked_add"),
             docs_url: "https://vaultlint.com/rules/VL003/".to_string(),
+            live_at: Vec::new(),
         };
         let medium_finding = Finding {
             rule_id: Cow::Borrowed("VL003"),
@@ -371,6 +375,7 @@ mod tests {
             snippet: String::new(),
             help: Cow::Borrowed("add overflow-checks = true"),
             docs_url: "https://vaultlint.com/rules/VL003/".to_string(),
+            live_at: Vec::new(),
         };
 
         let render_with = |findings: Vec<Finding>| -> serde_json::Value {

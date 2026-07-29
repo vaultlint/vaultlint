@@ -219,10 +219,17 @@ fn artifact_location(finding_path: &Path, scan_root: Option<&Path>) -> Value {
 // ── Result and invocation ─────────────────────────────────────────────────────
 
 fn result(finding: &Finding, scan_root: Option<&Path>) -> Value {
+    // Appended to the message rather than parked in a property bag: GitHub's
+    // Security tab renders `message.text` and little else, and a reader who
+    // never learns the code is live has been told the least useful half.
+    let live = match finding.live_at.as_slice() {
+        [] => String::new(),
+        addresses => format!(" Live on mainnet at {}.", addresses.join(", ")),
+    };
     json!({
         "ruleId": finding.rule_id,
         "level": level(finding.severity),
-        "message": { "text": format!("{}: {}", finding.title, finding.message) },
+        "message": { "text": format!("{}: {}{live}", finding.title, finding.message) },
         "locations": [{
             "physicalLocation": {
                 "artifactLocation": artifact_location(&finding.file, scan_root),

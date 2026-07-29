@@ -127,6 +127,7 @@ pub fn overflow_checks_finding(manifest: &Path) -> Finding {
              value.",
         ),
         docs_url: "https://vaultlint.com/rules/VL003/".to_string(),
+        live_at: Vec::new(),
     }
 }
 

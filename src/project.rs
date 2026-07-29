@@ -252,6 +252,17 @@ fn is_excluded(value: &toml::Value, workspace_dir: &Path, package_dir: &Path) ->
     false
 }
 
+/// The manifest of the crate that contains `file`, normalised so that two
+/// spellings of one path compare equal.
+///
+/// This is the *package* manifest, not the workspace root [`Workspace::manifest`]
+/// resolves to — the unit that owns a `declare_id!` and the source files around it.
+pub(crate) fn package_manifest(file: &Path) -> Option<PathBuf> {
+    let file = normalised(file);
+    let dir = file.parent().unwrap_or(&file);
+    walk_to_cargo_toml(dir)
+}
+
 /// Walks up from `dir` (inclusive) and returns the first `Cargo.toml` found,
 /// or `None` if none exists.
 fn walk_to_cargo_toml(dir: &Path) -> Option<PathBuf> {
