@@ -177,6 +177,13 @@ def cmd_active(args, rpc):
         for tx in blk["transactions"]:
             msg = tx["transaction"]["message"]
             meta = tx.get("meta") or {}
+            # An instruction addresses accounts by index into one concatenated space:
+            # the message's own keys, then the lookup-table addresses, writable before
+            # readonly. The order is the whole of the contract — swap the two loaded
+            # lists and every index past the static ones silently resolves to the wrong
+            # account, with no error anywhere. Verified 2026-09-18 against
+            # encoding=jsonParsed, which resolves ids server-side: they agree, and 617 of
+            # 5798 invocations in the sampled block addressed a program through a table.
             keys = list(msg["accountKeys"])
             loaded = meta.get("loadedAddresses") or {}
             keys += loaded.get("writable", []) + loaded.get("readonly", [])
