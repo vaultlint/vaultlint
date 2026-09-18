@@ -153,3 +153,12 @@ document's numbers bit for bit.
 
 Re-running in a later quarter produces a comparable series; the seed, block count, stride and
 calibration span are all flags with the values used here as defaults.
+
+One caveat found on 2026-09-18, after this snapshot was taken. `getBlock` refuses any block holding
+a transaction newer than the version the caller declares, and mainnet served only version 0 in July
+and version 1 by September. The `active` step asked for version 0 and asked quietly, so every block
+came back as an error, was skipped, and the step wrote an **empty** census that looked like a
+successful run. The version is now `--max-tx-version` (default 1), and the step exits non-zero
+instead of writing an empty result when no block resolves. Raise the flag when the network moves
+again; a re-run of `active` and `headers active` on 2026-09-18 resolved 227 of 235 invoked programs,
+with the same 8 native programs carrying no ProgramData account.

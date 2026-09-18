@@ -165,7 +165,7 @@ def cmd_active(args, rpc):
                 {
                     "encoding": "json",
                     "transactionDetails": "full",
-                    "maxSupportedTransactionVersion": 0,
+                    "maxSupportedTransactionVersion": args.max_tx_version,
                     "rewards": False,
                 },
             ],
@@ -189,6 +189,14 @@ def cmd_active(args, rpc):
                         counts[keys[idx]] += 1
         progress(f"blocks {blocks}/{args.blocks}  distinct {len(counts)}")
     sys.stderr.write("\n")
+    if not blocks:
+        # Every block was skipped. The usual cause is a transaction version newer than
+        # --max-tx-version: getBlock then errors, and since this loop asks quietly it
+        # would otherwise write an empty census that looks like a successful run.
+        sys.exit(
+            f"no block resolved out of {args.blocks} requested. If mainnet has moved past "
+            f"transaction version {args.max_tx_version}, re-run with --max-tx-version raised."
+        )
     json.dump(counts.most_common(), open(path(args, "active-counts.json"), "w"))
     print(f"tip slot {tip}  blocks {blocks}  distinct {len(counts)}  invocations {sum(counts.values()):,}")
 
@@ -361,6 +369,10 @@ def main():
     a = sub.add_parser("active")
     a.add_argument("--blocks", type=int, default=25)
     a.add_argument("--stride", type=int, default=40)
+    # Mainnet served only version 0 in July 2026 and version 1 by September. getBlock
+    # refuses a block containing anything newer than this, so it is a flag rather than
+    # a constant: raise it when the network moves again.
+    a.add_argument("--max-tx-version", type=int, default=1)
 
     h = sub.add_parser("headers")
     h.add_argument("population", choices=["all", "active"])
