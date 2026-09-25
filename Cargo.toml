@@ -11,7 +11,13 @@ readme = "README.md"
 keywords = ["solana", "anchor", "security", "linter", "static-analysis"]
 categories = ["development-tools"]
 autoexamples = false
-exclude = [".superpowers/", ".github/"]
+# The package carries the tool: sources, tests, examples, README, changelog, licences.
+# Everything under docs/ is research and working notes — the measurement reports, the
+# census script, the design spec, the undecided product options. Their home is the
+# repository and the site, where they are read and linked, not the tarball someone
+# downloads to install a linter. Excluding them changes nothing about who can read
+# them: all of it stays public in the repository.
+exclude = [".superpowers/", ".github/", "docs/"]
 
 [dependencies]
 anyhow = "1"
